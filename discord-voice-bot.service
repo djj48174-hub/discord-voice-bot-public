@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord 24/7 Voice Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/discord-voice-bot
+ExecStart=/usr/bin/node bot.js
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/discord-voice-bot/bot.log
+StandardError=append:/home/ubuntu/discord-voice-bot/bot.log
+
+[Install]
+WantedBy=multi-user.target

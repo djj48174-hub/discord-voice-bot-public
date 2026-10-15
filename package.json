@@ -1,0 +1,16 @@
+{
+  "name": "discord-voice-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "بوت ديسكورد يبقى 24/7 داخل روم صوتي",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "libsodium-wrappers": "^0.7.15"
+  }
+}

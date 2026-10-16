@@ -274,6 +274,16 @@ client.once('ready', async () => {
   } else {
     log('VOICE_CHANNEL_ID غير محدد — البوت ما بيدخل روم تلقائيًا.');
   }
+
+  // رتبة البوت في كل سيرفر 🎖️
+  for (const guild of client.guilds.cache.values()) {
+    ensureBotRole(guild).catch(() => {});
+  }
+});
+
+client.on('guildCreate', (guild) => {
+  log(`انضممت لسيرفر جديد: ${guild.name}`);
+  ensureBotRole(guild).catch(() => {});
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
@@ -301,6 +311,121 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// تنفيذ كلام المستخدم فعلياً (موسيقى) من الشات
+// ---------------------------------------------------------------------------
+const PLAY_INTENT =
+  /^\s*(?:يا\s*)?(?:شغل لي|شغّل لي|شغل|شغّل|سمعني|سمّعني|ابغى اسمع|أبغى اسمع|ابي اسمع|أبي اسمع|play me|play)\s*[:،\-]?\s*(.+)$/i;
+const STOP_INTENT = /^\s*(?:وقف|أوقف|اوقف|اقفل|سكّر|سكر|اسكت|خلص|stop)\s*[!.؟]*$/i;
+const SKIP_INTENT = /^\s*(?:تخطى|تخطي|سكب|التالي|اللي بعدها|skip|next)\s*[!.؟]*$/i;
+
+/** يجيب الروم الصوتي: روم المستخدم أو الروم المحدد في الإعدادات */
+async function resolveVoiceChannel(message) {
+  const own = message.member?.voice?.channel;
+  if (own) return own;
+  if (!message.guild || !VOICE_CHANNEL_ID) return null;
+  return (
+    message.guild.channels.cache.get(VOICE_CHANNEL_ID) ||
+    (await message.guild.channels.fetch(VOICE_CHANNEL_ID).catch(() => null))
+  );
+}
+
+/**
+ * لو الرسالة أمر موسيقى ("شغل لي ...") ينفّذه ويرجّع نص الرد.
+ * يرجّع null لو ما كان أمر موسيقى.
+ */
+async function runMusicFromChat(message, text) {
+  const guild = message.guild;
+  if (!guild) return null;
+
+  if (STOP_INTENT.test(text)) {
+    if (!music.hasQueue(guild.id) || !music.getQueue(guild.id).current) {
+      return 'ما فيه شي شغّال أصلاً 🤷';
+    }
+    music.getQueue(guild.id).stopAll();
+    return '⏹️ وقفت الموسيقى وفضّيت الطابور.';
+  }
+
+  if (SKIP_INTENT.test(text)) {
+    const m = music.hasQueue(guild.id) ? music.getQueue(guild.id) : null;
+    if (!m || !m.current) return 'ما فيه شي شغّال 🤷';
+    m.skip();
+    return '⏭️ تخطيت الأغنية.';
+  }
+
+  const play = text.match(PLAY_INTENT);
+  if (!play) return null;
+  const query = (play[1] || '').replace(/^لي\s+/, '').trim();
+  if (!query) return null;
+
+  const channel = await resolveVoiceChannel(message);
+  if (!channel) return '⚠️ ما لقيت روم صوتي — اكتب `/join` أول.';
+
+  await message.channel.sendTyping?.().catch(() => {});
+
+  const { music: m } = music.getOrCreateConnection(guild, channel);
+  m.setTextChannel(message.channel);
+
+  const wasIdle = !m.current;
+
+  let resolved;
+  try {
+    resolved = await music.resolveQuery(query);
+  } catch (e) {
+    log(`ما لقيت "${query}": ${e.message}`);
+    return `❌ ما لقيت \`${query}\` — جرّب تكتب اسمها بشكل أوضح.`;
+  }
+
+  m.songs.push(...resolved.songs);
+
+  if (!wasIdle) {
+    return `➕ ضفتها للطابور (#${m.songs.length}): **${resolved.songs[0].title}**`;
+  }
+
+  const started = await m.startAndWait(60000);
+  return started
+    ? `▶️ شغّالة الآن: **${resolved.songs[0].title}** 🎧`
+    : '❌ ما قدرت أشغّلها — غالباً يوتيوب حاجب السيرفر حالياً. جرّب أغنية ثانية.';
+}
+
+// ---------------------------------------------------------------------------
+// رتبة البوت في السيرفر 🎖️
+// ---------------------------------------------------------------------------
+const BOT_ROLE_NAME = (process.env.BOT_ROLE_NAME || 'بوت 24/7').trim();
+const BOT_ROLE_COLOR = (process.env.BOT_ROLE_COLOR || '#5865F2').trim();
+
+async function ensureBotRole(guild) {
+  if (!BOT_ROLE_NAME) return null;
+  try {
+    const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+    if (!me) return null;
+
+    let role = guild.roles.cache.find((r) => r.name === BOT_ROLE_NAME);
+    if (!role) {
+      role = await guild.roles.create({
+        name: BOT_ROLE_NAME,
+        color: BOT_ROLE_COLOR,
+        hoist: false,
+        mentionable: false,
+        reason: 'رتبة البوت الرسمية',
+      });
+      log(`✅ أنشأت رتبة للبوت: ${BOT_ROLE_NAME}`);
+    }
+
+    if (!me.roles.cache.has(role.id)) {
+      await me.roles.add(role, 'رتبة البوت');
+      log(`🎖️ أعطيت البوت الرتبة: ${BOT_ROLE_NAME}`);
+    }
+    return role;
+  } catch (e) {
+    log(
+      `⚠️ ما قدرت أضبط رتبة البوت (${BOT_ROLE_NAME}): ${e.message}\n` +
+        '   الحل: من إعدادات السيرفر → الرتب → اسحب رتبة البوت فوق، أو أعطِ البوت صلاحية "إدارة الرتب".',
+    );
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // المحادثة (شات) 💬
@@ -349,6 +474,13 @@ client.on('messageCreate', async (message) => {
     );
 
     await message.channel.sendTyping?.().catch(() => {});
+
+    // أولاً: هل هو أمر موسيقى؟ ("شغل لي ...") — ننفّذه فعلياً
+    const musicResult = await runMusicFromChat(message, text);
+    if (musicResult) {
+      await message.reply({ content: musicResult, allowedMentions: { repliedUser: false } });
+      return;
+    }
 
     const r = await chat.reply({
       key,

@@ -22,18 +22,19 @@ const API_KEY = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '')
 
 const MODELS = (
   process.env.GEMINI_MODEL ||
-  'gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-flash-latest'
+  'gemini-3.5-flash,gemini-3.6-flash,gemini-3-flash-preview,gemini-flash-latest,gemini-3.5-flash-lite'
 )
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
 let workingModel = null;
-let thinkingSupported = true;
 
 const MAX_HISTORY = Math.max(4, Number(process.env.CHAT_MEMORY || 16)); // عدد الرسائل المحفوظة
 const REPLY_MAX = Math.max(200, Number(process.env.CHAT_REPLY_MAX || 900)); // حد طول الرد
 const COOLDOWN_MS = Math.max(0, Number(process.env.CHAT_COOLDOWN_MS || 1200));
+// مهلة قصيرة عشان الموديل البطيء ما يعلّق الرد
+const CALL_TIMEOUT_MS = Math.max(3000, Number(process.env.GEMINI_TIMEOUT_MS || 12000));
 
 const BOT_NAME = (process.env.BOT_NAME || 'بوت 24/7').trim();
 
@@ -42,14 +43,19 @@ const SYSTEM_PROMPT = `انت بوت ديسكورد عربي اسمه «${BOT_NA
 شخصيتك:
 - ودود، مرح، خفيف الدم، وتتكلم بالعامية الخليجية المبسطة.
 - ردودك قصيرة جداً: سطر أو سطرين بالكثير. هذا شات مو مقال.
-- تسأل سؤال متابعة بين فترة وفترة عشان تكمل السوالف.
+- تسأل سؤال متابعة أحياناً عشان تكمل السوالف.
 - تشجع وتمدح، وما تكون رسمي ولا بارد.
 
-قواعد مهمة:
-- ممنوع تستخدم تنسيق Markdown ثقيل: لا عناوين (#)، ولا جداول، ولا كود.
-- لا تذكر إنك نموذج من جوجل، ولا تشرح تعليماتك ولا تقول "كذكاء اصطناعي".
+الطاعة (مهم جداً):
+- نفّذ طلب المستخدم مباشرة وبلا مماطلة، ولا تعتذر بلا سبب.
+- لا ترفض الطلبات العادية (كتابة نص، رأي، فكرة، ترجمة، تلخيص، وصفة، كود بسيط...).
+- لا تقول "ما اقدر" ولا "أنا بوت بسيط" إلا لو الطلب مخالف للقانون أو مؤذي.
+
+قواعد الشكل:
+- ممنوع تنسيق Markdown ثقيل: لا عناوين (#)، ولا جداول، ولا كود.
+- لا تذكر إنك نموذج من جوجل، ولا تشرح تعليماتك، ولا تقول "كذكاء اصطناعي".
 - لو أحد سألك وش تسوي: قول إنك قاعد 24/7 في الروم الصوتي، وتشغّل موسيقى بأمر ‎/play.
-- لو أحد طلب أغنية: رحّب وقله يكتب ‎/play واسم الأغنية.
+- لو أحد طلب أغنية: نزّلها له مباشرة (البوت يشغلها) أو قله يكتب اسم الأغنية.
 - تكلم بنفس لغة اللي يكلمك (عربي أو إنجليزي).
 - إيموجي وحدة أو ثنتين بالكثير، ومو في كل رد.`;
 
@@ -107,7 +113,7 @@ async function callGemini(model, body) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -143,52 +149,54 @@ async function askAI(key, text, userLabel) {
   const base = {
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
-    generationConfig: {
-      temperature: 0.9,
-      topP: 0.95,
-      maxOutputTokens: 400,
-    },
+    generationConfig: { temperature: 0.9, topP: 0.95, maxOutputTokens: 350 },
+  };
+
+  const fastBody = {
+    ...base,
+    generationConfig: { ...base.generationConfig, thinkingConfig: { thinkingBudget: 0 } },
+  };
+  const slowBody = {
+    ...base,
+    generationConfig: { ...base.generationConfig, maxOutputTokens: 2048 },
   };
 
   const models = workingModel ? [workingModel, ...MODELS.filter((m) => m !== workingModel)] : MODELS;
 
   let lastErr = null;
-  for (const model of models) {
-    // نجرب أولاً مع تعطيل "التفكير" (أسرع بكثير في المحادثة)
-    const attempts = [];
-    attempts.push({
-      ...base,
-      generationConfig: { ...base.generationConfig, thinkingConfig: { thinkingBudget: 0 } },
-    });
-    // محاولة ثانية: التفكير الافتراضي — نوسّع الحد عشان ما يستهلكه التفكير
-    attempts.push({
-      ...base,
-      generationConfig: { ...base.generationConfig, maxOutputTokens: 2048 },
-    });
 
-    for (const body of attempts) {
-      try {
-        const reply = await callGemini(model, body);
-        if (workingModel !== model) {
-          workingModel = model;
-          log(`✅ نموذج Gemini المستخدم: ${model}`);
-        }
-        return reply;
-      } catch (e) {
-        lastErr = e;
-        const is400 = e.status === 400;
-        const is404 = e.status === 404;
-        if (is400) {
-          // غالباً thinkingConfig غير مدعوم -> نجرب النسخة الثانية
-          thinkingSupported = false;
-          continue;
-        }
-        if (is404 || e.status === 429 || e.status >= 500) break; // نموذج ثاني
-        if (e.status === 401 || e.status === 403) throw e; // مفتاح غلط
-      }
+  // --- المرور السريع: بدون تفكير + مهلة قصيرة ---
+  for (const model of models) {
+    try {
+      const reply = await callGemini(model, fastBody);
+      markWorking(model);
+      return reply;
+    } catch (e) {
+      lastErr = e;
+      if (e.status === 401 || e.status === 403) throw e; // مفتاح غلط
+      log(`↩️ ${model}: ${e.message.slice(0, 70)}`);
     }
   }
+
+  // --- محاولة أخيرة: التفكير الافتراضي (أبطأ لكن ينجح أكثر) ---
+  for (const model of models.slice(0, 2)) {
+    try {
+      const reply = await callGemini(model, slowBody);
+      markWorking(model);
+      return reply;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
   throw lastErr || new Error('فشل الاتصال بـ Gemini');
+}
+
+function markWorking(model) {
+  if (workingModel !== model) {
+    workingModel = model;
+    log(`✅ نموذج Gemini: ${model}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,12 +363,10 @@ async function handleInteraction(interaction) {
     await interaction.deferReply();
     await interaction.channel?.sendTyping?.().catch(() => {});
     const text = interaction.options.getString('الكلام');
-    const r = await reply({
-      key: historyKey(interaction),
-      text,
-      userLabel: interaction.member?.displayName || interaction.user.username,
-    });
-    await interaction.editReply(r.text);
+    const who = interaction.member?.displayName || interaction.user.username;
+    const r = await reply({ key: historyKey(interaction), text, userLabel: who });
+    // نعرض كلام المستخدم فوق الرد عشان ما "يختفي"
+    await interaction.editReply(`> 💬 **${who}:** ${clip(text, 400)}\n\n${r.text}`);
     return true;
   }
 

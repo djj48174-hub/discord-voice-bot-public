@@ -228,15 +228,17 @@ function runYtDlp(args) {
 
 function mapEntry(e) {
   const id = e.id;
+  const url =
+    e.webpage_url || e.original_url || (id ? `https://www.youtube.com/watch?v=${id}` : e.url);
+  const isSc = /soundcloud\.com|snd\.sc/i.test(url || '');
+  const isYt = /youtube\.com|youtu\.be/i.test(url || '');
   return {
     id,
     title: e.title || 'بدون عنوان',
-    url:
-      e.webpage_url ||
-      e.original_url ||
-      (id ? `https://www.youtube.com/watch?v=${id}` : e.url),
+    url,
     duration: Number(e.duration) || 0,
     uploader: e.uploader || e.channel || e.artist || '',
+    source: isSc ? 'soundcloud' : isYt ? 'youtube' : 'other',
   };
 }
 
@@ -299,6 +301,8 @@ async function searchSoundCloud(query, limit = 3) {
       url: e.webpage_url || e.url || '',
       duration: Number(e.duration) || 0,
       uploader: e.uploader || e.artist || e.channel || '',
+      artwork: e.thumbnail || null,
+      source: 'soundcloud',
     }))
     .filter((s) => s.url);
 }
@@ -312,14 +316,17 @@ async function findOnSoundCloud(song) {
 }
 
 async function resolveQuery(query, maxPlaylist = 25) {
-  const isUrl = /^https?:\/\//i.test(query.trim());
+  const q = query.trim();
+  const isUrl = /^https?:\/\//i.test(q);
 
   if (isUrl) {
+    const isSoundCloud = /soundcloud\.com|snd\.sc/i.test(q);
+
     const { out, err, code } = await runYtDlp([
       '--dump-single-json',
       '--no-warnings',
       ...extraYtdlpArgs(),
-      query.trim(),
+      q,
     ]);
     if (code !== 0) {
       const last = err.split('\n').map((s) => s.trim()).filter(Boolean).pop();
@@ -331,12 +338,30 @@ async function resolveQuery(query, maxPlaylist = 25) {
       if (!list.length) throw new Error('قائمة التشغيل فاضية');
       return { type: 'playlist', songs: list, name: json.title || 'قائمة تشغيل' };
     }
-    return { type: 'single', songs: [mapEntry(json)] };
+    const single = mapEntry(json);
+    if (isSoundCloud) single.source = 'soundcloud';
+    return { type: 'single', songs: [single] };
   }
 
-  const results = await searchSongs(query, 1);
+  // اسم أغنية -> ساوند كلاود أولاً.
+  // السبب: يوتيوب يحجب مقاطع كثيرة من IP السيرفرات ("Sign in to confirm you're not a bot")
+  //         بينما ساوند كلاود يشتغل عادي.
+  const preferYouTube = /^youtube$/i.test((process.env.PREFER_SOURCE || '').trim());
+  if (!preferYouTube) {
+    try {
+      const sc = await searchSoundCloud(q, 1);
+      if (sc.length) {
+        log(`🔎 ساوند كلاود: ${sc[0].title}`);
+        return { type: 'single', songs: [{ ...sc[0], source: 'soundcloud' }] };
+      }
+    } catch (e) {
+      log(`⚠️ بحث ساوند كلاود فشل (بنجرّب يوتيوب): ${String(e.message).slice(0, 90)}`);
+    }
+  }
+
+  const results = await searchSongs(q, 1);
   if (!results.length) throw new Error('ما لقيت أي نتيجة لهذا الاسم');
-  return { type: 'single', songs: [results[0]] };
+  return { type: 'single', songs: [{ ...results[0], source: 'youtube' }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +514,7 @@ class GuildMusic {
     }
     this.notify(
       '❌ ما قدرت أشغّل الأغاني المتبقية.\n' +
-        'غالباً يوتيوب حاجب السيرفر حالياً — جرّب `/play` مرة ثانية بعد شوي.',
+        'جرّب `/play` مرة ثانية باسم مختلف، أو الصق رابطاً مباشراً.',
     );
   }
 
@@ -503,6 +528,35 @@ class GuildMusic {
    * يرجّع true فقط لو وصل صوت حقيقي فعلاً.
    */
   async play(song) {
+    // مصدر غير يوتيوب (ساوند كلاود) -> نشغّل مباشرة، ما فيه عملاء نجرّبهم
+    const isYouTube = /youtube\.com|youtu\.be/i.test(song.url || '');
+    if (!isYouTube) {
+      this.current = song;
+      if (await this._tryPlay(song, null)) return true;
+
+      // فشل ساوند كلاود؟ نجرب نفس الاسم في يوتيوب كحل أخير
+      if (!song.altTried) {
+        song.altTried = true;
+        try {
+          const results = await searchSongs(song.title, 1);
+          if (results[0]) {
+            const alt = { ...results[0], source: 'youtube' };
+            log(`🔄 ساوند كلاود ما نفع — أجرّب يوتيوب: «${alt.title}»`);
+            if (await this._tryPlay(alt, activeClient || 'android')) {
+              Object.assign(song, { url: alt.url, id: alt.id, title: alt.title, source: 'youtube' });
+              return true;
+            }
+          }
+        } catch {
+          /* تجاهل */
+        }
+      }
+
+      this.current = null;
+      this.currentStream = null;
+      return false;
+    }
+
     const order = activeClient
       ? [activeClient, ...CLIENT_CANDIDATES.filter((c) => c !== activeClient)]
       : CLIENT_CANDIDATES;
@@ -791,8 +845,8 @@ function nowPlayingEmbed(music) {
       { name: 'الصوت', value: `${Math.round(music.volume * 100)}%`, inline: true },
       { name: 'التكرار', value: music.repeat ? 'مفعّل 🔁' : 'متوقف', inline: true },
     );
-  if (s.uploader) embed.addFields({ name: 'القناة', value: s.uploader, inline: true });
-  const thumb = youtubeThumb(s.id);
+  if (s.uploader) embed.addFields({ name: 'الصوت من', value: s.uploader, inline: true });
+  const thumb = s.source === 'youtube' ? youtubeThumb(s.id) : s.artwork || youtubeThumb(s.id);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -804,7 +858,7 @@ function buildCommands() {
   return [
     new SlashCommandBuilder()
       .setName('play')
-      .setDescription('يشغّل أغنية (اكتب الاسم أو الصق رابط يوتيوب)')
+      .setDescription('يشغّل أغنية (اكتب الاسم أو الصق رابط يوتيوب / ساوند كلاود)')
       .addStringOption((o) =>
         o.setName('الاسم').setDescription('اسم الأغنية أو الرابط').setRequired(true),
       )
@@ -942,7 +996,7 @@ async function handleInteraction(interaction, opts) {
       } else {
         await interaction.editReply(
           '❌ ما قدرت أشغّل هذي الأغنية.\n' +
-            'غالباً الفيديو ممنوع أو يوتيوب رافض التحميل حالياً — جرّب أغنية ثانية.',
+            'جرّب تكتب اسمها بطريقة ثانية، أو الصق رابطاً مباشراً (يوتيوب أو ساوند كلاود).',
         );
       }
     }

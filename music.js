@@ -980,7 +980,119 @@ function diagnostics() {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// تشخيص المصادر (يستخدمه /diag عشان نعرف وش يشتغل من هذا السيرفر)
+// ---------------------------------------------------------------------------
+/** يجرّب تحميل فعلي ويرجّع كم بايت وصل قبل ما نوقفه */
+function probeDownload(extraArgs, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      YTDLP,
+      [
+        '-f',
+        'bestaudio/best',
+        '-o',
+        '-',
+        '--no-playlist',
+        '--no-part',
+        '--no-progress',
+        '--no-warnings',
+        ...extraYtdlpArgs(),
+        ...extraArgs,
+      ],
+      { windowsHide: true },
+    );
+
+    let err = '';
+    let out = '';
+    let bytes = 0;
+    let done = false;
+
+    const finish = (ok, why) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        proc.kill(IS_WIN ? undefined : 'SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      resolve({ ok, bytes, out, why: why || '' });
+    };
+
+    proc.stderr.on('data', (d) => {
+      err += d.toString();
+      if (err.length > 3000) err = err.slice(-1500);
+    });
+    proc.stdout.on('data', (d) => {
+      bytes += d.length;
+      if (out.length < 400000) out += d.toString();
+      if (bytes > 60000) finish(true); // وصلنا بايتات كافية
+    });
+    proc.on('error', (e) => finish(false, e.message));
+    proc.on('close', (code) => {
+      const last = err.split('\n').map((s) => s.trim()).filter(Boolean).pop();
+      finish(bytes > 0, last || `exit ${code}`);
+    });
+
+    const timer = setTimeout(() => finish(bytes > 0, 'انتهت المدة'), timeoutMs);
+  });
+}
+
+/** يفحص كل عملاء يوتيوب + ساوند كلاود من هذا السيرفر */
+async function diagnose(extraQuery = process.env.DIAG_QUERY || '') {
+  const ytUrl = process.env.YTDLP_PROBE_URL || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  const clients = [...new Set([...CLIENT_CANDIDATES, 'default'])];
+
+  const youtube = await Promise.all(
+    clients.map(async (c) => {
+      const r = await probeDownload([...clientArgs(c), ytUrl], 15000);
+      return { client: c, ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why };
+    }),
+  );
+
+  // ساوند كلاود: بحث ثم تحميل
+  const q = extraQuery || 'music';
+  const scSearch = await probeDownload(['--dump-single-json', '--flat-playlist', `scsearch3:${q}`], 15000);
+  let scTitle = null;
+  let scUrl = null;
+  let scResult = { ok: false, why: 'البحث فشل' };
+
+  if (scSearch.ok) {
+    try {
+      const j = JSON.parse(scSearch.stdout || '{}');
+      const e = (j.entries || []).filter(Boolean)[0];
+      if (e) {
+        scTitle = e.title || null;
+        scUrl = e.url || e.webpage_url || null;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (scUrl) {
+    const r = await probeDownload([scUrl], 15000);
+    scResult = { ok: r.ok, bytes: r.bytes, why: r.why };
+  }
+
+  return {
+    at: new Date().toISOString(),
+    cookies: Boolean(cookieFilePath()),
+    ytdlpVersion: YTDLP,
+    youtube,
+    soundcloud: {
+      searchQuery: q,
+      searchOk: scSearch.ok,
+      firstTitle: scTitle,
+      firstUrl: scUrl,
+      download: scResult,
+    },
+  };
+}
+
 module.exports = {
+  diagnose,
   buildCommands,
   handleInteraction,
   getQueue,

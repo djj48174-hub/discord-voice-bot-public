@@ -78,8 +78,32 @@ const client = new Client({
 // HTTP Health Check (لـ Render/Koyeb — يمنع النوم)
 // ---------------------------------------------------------------------------
 const HEALTH_PORT = Number(process.env.PORT || 3000);
-const healthServer = http.createServer((req, res) => {
+const healthServer = http.createServer(async (req, res) => {
   const ua = req.headers['user-agent'] || 'unknown';
+
+  // فحص المصادر من داخل السيرفر (محمي بمفتاح)
+  if (req.url.startsWith('/diag')) {
+    const key = new URL(req.url, 'http://localhost').searchParams.get('key') || '';
+    const want = (process.env.DIAG_KEY || '').trim();
+    if (!want || key !== want) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
+    log('[diag] طلب فحص المصادر…');
+    try {
+      const data = await music.diagnose();
+      log('[diag] تم الفحص');
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (e) {
+      log('[diag] فشل:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   if (req.url === '/health' || req.url === '/') {
     const guild =
       (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();

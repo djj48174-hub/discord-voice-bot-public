@@ -276,6 +276,8 @@ async function registerCommands() {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
+  log(`📥 أمر: /${interaction.commandName} — من ${interaction.user.tag} (${interaction.guild?.name ?? 'خاص'})`);
+
   try {
     // أوامر الموسيقى أولاً (play/skip/pause/resume/stop/queue/nowplaying/volume)
     const handled = await music.handleInteraction(interaction, {
@@ -343,6 +345,20 @@ client.on('interactionCreate', async (interaction) => {
     } else {
       await interaction.reply({ content: `صار خطأ: ${err.message}`, ephemeral: true }).catch(() => {});
     }
+    return;
+  }
+
+  // شبكة أمان: أي أمر ما تعاملنا معه نرد عليه عشان ما يطلع "التطبيق ما استجاب"
+  if (!interaction.replied && !interaction.deferred) {
+    log(`⚠️ أمر غير معروف: /${interaction.commandName}`);
+    await interaction
+      .reply({
+        content:
+          `ما عرفت الأمر \`/${interaction.commandName}\` 😅\n` +
+          'الأوامر المتاحة: `/play` `/skip` `/pause` `/resume` `/stop` `/queue` `/nowplaying` `/volume` `/join` `/leave` `/status`',
+        ephemeral: true,
+      })
+      .catch(() => {});
   }
 });
 
@@ -351,6 +367,15 @@ client.on('interactionCreate', async (interaction) => {
 // ---------------------------------------------------------------------------
 setInterval(() => {
   ensureConnected().catch((e) => log('خطأ في الفحص الدوري:', e.message));
+
+  // فحص اتصال البوابة (لو تعطّل، ما بنستقبل أوامر)
+  try {
+    if (client.isReady() && client.ws.status !== 0) {
+      log(`⚠️ اتصال البوابة غير سليم (status=${client.ws.status}) — البوت ما بيستقبل أوامر!`);
+    }
+  } catch {
+    /* ignore */
+  }
 }, CHECK_MS);
 
 // شبكة أمان: أي خطأ غير متوقع لا يوقف البوت

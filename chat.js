@@ -184,7 +184,7 @@ function parseRetryMs(text) {
 
 function handleErr(id, e) {
   if (e.status === 429) {
-    const hinted = parseRetryMs(e.body || '');
+    const hinted = Number(e.retryMs) > 0 ? Number(e.retryMs) : parseRetryMs(e.body || '');
     const ms = hinted || 10 * 60 * 1000; // افتراضي: 10 دقايق
     exhaustedUntil.set(id, Date.now() + ms);
     const mins = Math.max(1, Math.round(ms / 60000));
@@ -271,6 +271,10 @@ async function callGroq(model, messages) {
     const err = new Error(`Groq ${res.status}: ${txt.slice(0, 300)}`);
     err.status = res.status;
     err.body = txt;
+    // Groq يقول متى نرجع في الهيدر
+    const ra = Number(res.headers.get('retry-after'));
+    if (Number.isFinite(ra) && ra > 0) err.retryMs = ra * 1000;
+    if (err.status === 429 && !err.retryMs) err.retryMs = 60 * 1000; // افتراضي: دقيقة
     throw err;
   }
 

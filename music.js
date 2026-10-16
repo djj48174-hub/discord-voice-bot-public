@@ -256,24 +256,51 @@ class GuildMusic {
     this.connection = null;
     this.currentStream = null;
     this.startedAt = 0;
+    this.repeat = false;          // تكرار الأغنية الحالية
+    this._suppressRepeat = false; // نتجاهل التكرار لما نتخطى أو نغيّر الصوت
+    this._didPlay = false;        // هل الأغنية الحالية اشتغلت فعلاً؟
+    this._lastEndedAt = 0;
 
     this.player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Play },
     });
 
-    this.player.on(AudioPlayerStatus.Idle, () => {
-      if (this.currentStream) {
-        this.currentStream.kill();
-        this.currentStream = null;
-      }
-      this.current = null;
-      setTimeout(() => this.playNext(), 200);
+    this.player.on('stateChange', (_old, next) => {
+      if (next.status === AudioPlayerStatus.Playing) this._didPlay = true;
     });
+
+    this.player.on(AudioPlayerStatus.Idle, () => this._onEnded());
 
     this.player.on('error', (err) => {
       log('player error:', err.message);
-      setTimeout(() => this.playNext(), 200);
+      this._onEnded();
     });
+  }
+
+  /** يننادى لما تخلص الأغنية (أو تفشل) */
+  _onEnded() {
+    // حماية من الاستدعاء المزدوج (Idle + error)
+    const now = Date.now();
+    if (now - this._lastEndedAt < 300) return;
+    this._lastEndedAt = now;
+
+    if (this.currentStream) {
+      this.currentStream.kill();
+      this.currentStream = null;
+    }
+
+    const suppress = this._suppressRepeat;
+    this._suppressRepeat = false;
+
+    // التكرار: نرجّع الأغنية نفسها لأول الطابور
+    // (بس لو فعلاً اشتغلت، ومو حالة تخطٍّ)
+    if (this.repeat && this.current && !suppress && this._didPlay) {
+      this.songs.unshift(this.current);
+    }
+
+    this.current = null;
+    this._didPlay = false;
+    setTimeout(() => this.playNext(), 200);
   }
 
   attach(connection) {
@@ -284,6 +311,7 @@ class GuildMusic {
   play(song) {
     this.current = song;
     this.startedAt = Date.now();
+    this._didPlay = false;
 
     const { stream, kill } = createAudioStream(song.url, this.volume);
     this.currentStream = { kill };
@@ -340,6 +368,7 @@ class GuildMusic {
 
   skip() {
     if (this.currentStream) {
+      this._suppressRepeat = true; // التخطي ما يكرر نفس الأغنية
       this.player.stop(true);
     }
   }
@@ -347,6 +376,7 @@ class GuildMusic {
   stopAll() {
     this.songs = [];
     this.current = null;
+    this._suppressRepeat = true;
     if (this.currentStream) {
       this.currentStream.kill();
       this.currentStream = null;
@@ -360,11 +390,17 @@ class GuildMusic {
     if (this.current) {
       this.songs.unshift(this.current);
       if (this.currentStream) {
+        this._suppressRepeat = true; // عشان ما تتكرر مرتين
         this.player.stop(true);
       } else {
         this.playNext();
       }
     }
+  }
+
+  toggleLoop(force) {
+    this.repeat = typeof force === 'boolean' ? force : !this.repeat;
+    return this.repeat;
   }
 }
 
@@ -439,11 +475,12 @@ function nowPlayingEmbed(music) {
   const s = music.current;
   const embed = new EmbedBuilder()
     .setColor(0x1db954)
-    .setTitle('🎶 شغّال الآن')
+    .setTitle(music.repeat ? '🎶 شغّال الآن 🔁 (تكرار)' : '🎶 شغّال الآن')
     .setDescription(`**[${s.title}](${s.url})**`)
     .addFields(
       { name: 'المدة', value: formatDuration(s.duration), inline: true },
       { name: 'الصوت', value: `${Math.round(music.volume * 100)}%`, inline: true },
+      { name: 'التكرار', value: music.repeat ? 'مفعّل 🔁' : 'متوقف', inline: true },
     );
   if (s.uploader) embed.addFields({ name: 'القناة', value: s.uploader, inline: true });
   const thumb = youtubeThumb(s.id);
@@ -467,6 +504,20 @@ function buildCommands() {
     new SlashCommandBuilder().setName('pause').setDescription('يوقف التشغيل مؤقتاً').toJSON(),
     new SlashCommandBuilder().setName('resume').setDescription('يكمل التشغيل').toJSON(),
     new SlashCommandBuilder().setName('stop').setDescription('يوقف الموسيقى ويفضي الطابور').toJSON(),
+    new SlashCommandBuilder()
+      .setName('loop')
+      .setDescription('يكرر الأغنية الحالية (تشغيل/إيقاف التكرار)')
+      .addStringOption((o) =>
+        o
+          .setName('الوضع')
+          .setDescription('اختياري — بدونه يقلب التكرار')
+          .setRequired(false)
+          .addChoices(
+            { name: 'تشغيل التكرار 🔁', value: 'on' },
+            { name: 'إيقاف التكرار ⏹️', value: 'off' },
+          ),
+      )
+      .toJSON(),
     new SlashCommandBuilder().setName('queue').setDescription('يعرض قائمة الانتظار').toJSON(),
     new SlashCommandBuilder().setName('nowplaying').setDescription('يعرض الأغنية الحالية').toJSON(),
     new SlashCommandBuilder()
@@ -484,7 +535,17 @@ function buildCommands() {
   ];
 }
 
-const MUSIC_COMMANDS = ['play', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume'];
+const MUSIC_COMMANDS = [
+  'play',
+  'skip',
+  'pause',
+  'resume',
+  'stop',
+  'loop',
+  'queue',
+  'nowplaying',
+  'volume',
+];
 
 // ---------------------------------------------------------------------------
 // معالجة الأوامر
@@ -574,6 +635,18 @@ async function handleInteraction(interaction, opts) {
         );
       }
     }
+    return true;
+  }
+
+  // أمر التكرار — يشتغل حتى لو ما فيه شي شغّال حالياً
+  if (name === 'loop') {
+    const mode = interaction.options.getString('الوضع');
+    const on = music.toggleLoop(mode ? mode === 'on' : undefined);
+    await interaction.reply(
+      on
+        ? '🔁 **التكرار مفعّل** — راح يعيد الأغنية نفسها لما تخلص.'
+        : '⏹️ **التكرار متوقف** — راح ينتقل للأغنية اللي بعدها.',
+    );
     return true;
   }
 

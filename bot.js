@@ -68,6 +68,7 @@ const client = new Client({
 // ---------------------------------------------------------------------------
 const HEALTH_PORT = Number(process.env.PORT || 3000);
 const healthServer = http.createServer((req, res) => {
+  const ua = req.headers['user-agent'] || 'unknown';
   if (req.url === '/health' || req.url === '/') {
     const guild =
       (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();
@@ -76,6 +77,7 @@ const healthServer = http.createServer((req, res) => {
     const ready = Boolean(conn) && conn.state.status === VoiceConnectionStatus.Ready;
     const voice = ready && inChannelId ? 'connected' : inChannelId ? 'connecting' : 'disconnected';
 
+    log(`[health] زيارة من: ${ua}`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
       JSON.stringify({
@@ -90,6 +92,7 @@ const healthServer = http.createServer((req, res) => {
       }),
     );
   } else {
+    log(`[health] 404: ${req.method} ${req.url} — ${ua}`);
     res.writeHead(404);
     res.end('Not Found');
   }

@@ -30,6 +30,7 @@ const {
 
 const music = require('./music');
 const chat = require('./chat');
+const { VoiceChat } = require('./voicechat');
 
 // ---------------------------------------------------------------------------
 // الإعدادات
@@ -49,6 +50,7 @@ const MSG_CONTENT =
 let autoRejoin = true;   // يتوقف لما تكتب /leave
 let joinTimer = null;    // مؤقت إعادة الدخول
 let lastJoinAt = 0;      // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
+let voiceChat = null;    // وحدة المحادثة الصوتية (سماع المتكلمين)
 
 // مهلة السماح لمحاولة الاتصال قبل ما نعتبرها فاشلة ونعيدها
 const JOIN_GRACE_MS = 20000;
@@ -128,6 +130,7 @@ const healthServer = http.createServer(async (req, res) => {
           ? guild.channels.cache.get(inChannelId)?.name ?? inChannelId
           : null,
         uptime: Math.round(process.uptime()),
+        voiceChat: voiceChat ? voiceChat.stats : null,
       }),
     );
   } else {
@@ -245,6 +248,22 @@ function connect(guild, channel) {
       music.attachPlayerToConnection(guild.id, conn);
     } catch (e) {
       log('تنبيه: ما قدرت أربط مشغّل الموسيقى:', e.message);
+    }
+
+    // نفعّل السماع للمحادثة الصوتية
+    try {
+      if (voiceChat) voiceChat.stop();
+      voiceChat = new VoiceChat(conn, {
+        onUtterance: (u) => {
+          // المرحلة 1: نتأكد بس إنا نستقبل صوت
+          log(
+            `📥 مقطع صوتي من ${u.userId}: ${u.packets} حزمة / ${u.opus.length} بايت / ${u.seconds.toFixed(1)}ث`,
+          );
+        },
+      });
+      voiceChat.start();
+    } catch (e) {
+      log('تنبيه: تعذّر تشغيل المحادثة الصوتية:', e.message);
     }
   });
 

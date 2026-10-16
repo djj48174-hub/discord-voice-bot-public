@@ -798,7 +798,7 @@ class GuildMusic {
   }
 
   /**
-   * ينطق نصاً (Ogg Opus 48kHz — نفس صيغة الموسيقى) ويرجّع true لو اشتغل.
+   * ينطق نصاً (Ogg Opus 48kHz — نفس صيغة الموسيقى بالضبط) ويرجّع true لو اشتغل.
    */
   speak(oggBuffer, volume = 1) {
     this.pauseForVoice();
@@ -818,12 +818,14 @@ class GuildMusic {
       const timer = setTimeout(() => finish(false), 90000);
 
       try {
-        const resource = createAudioResource(Readable.from(oggBuffer), {
-          inputType: StreamType.OggOpus,
-          inlineVolume: true,
-        });
+        // نفس طريقة الموسيقى بالضبط: PassThrough بدون inlineVolume
+        // (inlineVolume يفسد حزم Opus المشفّرة)
+        const pt = new PassThrough();
+        pt.end(oggBuffer);
+        const resource = createAudioResource(pt, { inputType: StreamType.OggOpus });
         if (volume !== 1) resource.volume.setVolume(volume);
         this.player.play(resource);
+        log(`🔊 نطقنا (${oggBuffer.length} بايت)`);
       } catch (e) {
         log('⚠️ فشل النطق:', e.message);
         finish(false);

@@ -29,6 +29,7 @@ const {
 } = require('@discordjs/voice');
 
 const music = require('./music');
+const chat = require('./chat');
 
 // ---------------------------------------------------------------------------
 // الإعدادات
@@ -38,6 +39,12 @@ const GUILD_ID = (process.env.GUILD_ID || '').trim();
 const VOICE_CHANNEL_ID = (process.env.VOICE_CHANNEL_ID || '').trim();
 const CHECK_MS = Math.max(5, Number(process.env.CHECK_SECONDS || 30)) * 1000;
 const LOCK_TO_CHANNEL = String(process.env.LOCK_TO_CHANNEL || 'true').toLowerCase() !== 'false';
+
+// المحادثة
+const CHAT_ENABLED = String(process.env.CHAT_ENABLED || 'true').toLowerCase() !== 'false';
+// لازم تفعّل "Message Content Intent" في بوابة المطورين قبل ما تشغّل هذا
+const MSG_CONTENT =
+  String(process.env.ENABLE_MESSAGE_CONTENT || 'false').toLowerCase() === 'true';
 
 let autoRejoin = true;   // يتوقف لما تكتب /leave
 let joinTimer = null;    // مؤقت إعادة الدخول
@@ -60,6 +67,10 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    // اختياري: يخلي البوت يقرأ كل الرسائل (يحتاج تفعيله في بوابة المطورين)
+    ...(MSG_CONTENT ? [GatewayIntentBits.MessageContent] : []),
   ],
 });
 
@@ -255,6 +266,9 @@ client.once('ready', async () => {
   // (يتجاوز حجب "Sign in to confirm you're not a bot")
   music.ensureWorkingClient().catch((e) => log('تنبيه: فحص عملاء يوتيوب فشل:', e.message));
 
+  // فحص مفتاح الذكاء الاصطناعي (لو موجود)
+  chat.selfTest().catch((e) => log('تنبيه: فحص المحادثة فشل:', e.message));
+
   if (VOICE_CHANNEL_ID) {
     await ensureConnected();
   } else {
@@ -289,6 +303,66 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 // ---------------------------------------------------------------------------
+// المحادثة (شات) 💬
+// ---------------------------------------------------------------------------
+/** هل الرسالة تنادي البوت باسمه؟ */
+function callsBotByName(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  if (t.includes('بوت')) return true;
+  if (/bot\s*24\s*\/?\s*7/.test(t)) return true;
+  if (/\bbot\b/.test(t) && t.length < 60) return true; // "بوت" المكتوبة بحروف انجليزية
+  return false;
+}
+
+client.on('messageCreate', async (message) => {
+  if (!CHAT_ENABLED) return;
+  try {
+    if (!message.author || message.author.bot) return;
+    if (!client.user) return;
+
+    const isDM = !message.guild;
+    const mentioned = Boolean(message.mentions?.has?.(client.user));
+    const content = message.content || '';
+    // بدون "Message Content Intent" يوصل النص فقط للرسائل اللي فيها منشن أو الخاص
+    const named = MSG_CONTENT && callsBotByName(content);
+
+    if (!isDM && !mentioned && !named) return;
+
+    const key = isDM
+      ? `dm:${message.channelId}`
+      : `g:${message.guildId}:c:${message.channelId}`;
+
+    if (chat.throttled(key)) return;
+
+    // نشيل المنشن واسم البوت من النص
+    let text = content
+      .replace(new RegExp(`<@!?${client.user.id}>`, 'g'), ' ')
+      .replace(/^(يا\s*)?(بوت|bot)\s*24\s*\/?\s*7/i, ' ')
+      .replace(/^(يا\s*)?(بوت|bot)\b/i, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    log(
+      `💬 رسالة${isDM ? ' (خاص)' : ''} من ${message.author.tag}: ` +
+        `"${(text || '(فاضية)').slice(0, 80)}"`,
+    );
+
+    await message.channel.sendTyping?.().catch(() => {});
+
+    const r = await chat.reply({
+      key,
+      text: text || 'سلّم علي',
+      userLabel: message.member?.displayName || message.author.username,
+    });
+
+    await message.reply({ content: r.text, allowedMentions: { repliedUser: false } });
+  } catch (err) {
+    log('خطأ في المحادثة:', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // أوامر السلاش
 // ---------------------------------------------------------------------------
 async function registerCommands() {
@@ -297,6 +371,7 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('leave').setDescription('يطلع من الروم ويوقف الرجوع التلقائي'),
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
     ...music.buildCommands(),
+    ...chat.buildCommands(),
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
 
   try {
@@ -336,6 +411,10 @@ client.on('interactionCreate', async (interaction) => {
       defaultChannelId: VOICE_CHANNEL_ID,
     });
     if (handled) return;
+
+    // أوامر المحادثة (chat/chatreset)
+    const chatHandled = await chat.handleInteraction(interaction);
+    if (chatHandled) return;
 
     if (interaction.commandName === 'join') {
       autoRejoin = true;
@@ -384,7 +463,9 @@ client.on('interactionCreate', async (interaction) => {
           `داخل الروم 🟢\n` +
             `اسم الروم: **${interaction.guild.channels.cache.get(conn.joinConfig.channelId)?.name ?? 'غير معروف'}**\n` +
             `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
-            `الرجوع التلقائي: ${autoRejoin ? 'مفعّل' : 'متوقف'}`,
+            `الرجوع التلقائي: ${autoRejoin ? 'مفعّل' : 'متوقف'}\n` +
+            `السوالف: ${CHAT_ENABLED ? 'مفعّل' : 'متوقف'} | ` +
+            `ذكاء اصطناعي: ${chat.hasAI() ? `نعم (${chat.model || 'Gemini'})` : 'لا (ردود جاهزة)'}`,
         );
       } else {
         await interaction.reply('لست داخل أي روم صوتي 🔴');
@@ -407,7 +488,7 @@ client.on('interactionCreate', async (interaction) => {
       .reply({
         content:
           `ما عرفت الأمر \`/${interaction.commandName}\` 😅\n` +
-          'الأوامر المتاحة: `/play` `/skip` `/pause` `/resume` `/stop` `/queue` `/nowplaying` `/volume` `/join` `/leave` `/status`',
+          'الأوامر المتاحة: `/play` `/skip` `/pause` `/resume` `/stop` `/queue` `/nowplaying` `/volume` `/join` `/leave` `/status` `/chat`',
         ephemeral: true,
       })
       .catch(() => {});

@@ -108,18 +108,28 @@ const healthServer = http.createServer(async (req, res) => {
 
         const m = music.getQueue(g.id);
         const states = [];
-        const onState = (o, n) => states.push(`${o.status} -> ${n.status}`);
+        const onState = (o, n) => {
+          states.push(`${o.status} -> ${n.status}`);
+          log(`[diag] player: ${o.status} -> ${n.status}`);
+        };
         m.player.on('stateChange', onState);
 
         const ogg = await speech.speak('هلا، هذا اختبار صوت من البوت. هل تسمعني؟');
-        const ok = await m.speak(ogg, 1);
+        const p = m.speak(ogg, 1).then(
+          (v) => ({ ok: v }),
+          (e) => ({ ok: false, error: String(e.message).slice(0, 120) }),
+        );
+
+        // ننتظر بس 12 ثانية عشان ما نعلّق الطلب
+        await new Promise((r) => setTimeout(r, 12000));
+        const result = await Promise.race([p, Promise.resolve({ ok: null, note: 'لسا يشتغل' })]);
 
         setTimeout(() => m.player.off('stateChange', onState), 2000);
 
         const me = g.members?.me;
         const voice = me?.voice;
         return {
-          played: ok,
+          ...result,
           states,
           playerStatus: m.player.state.status,
           channelId: conn.joinConfig.channelId,
@@ -130,7 +140,6 @@ const healthServer = http.createServer(async (req, res) => {
           serverDeaf: voice?.deaf ?? null,
           suppress: voice?.suppress ?? null,
           speaking: voice?.speaking ?? null,
-          streamSuspended: voice?.streaming ?? null,
           voiceChannelMembers: (g.channels.cache.get(conn.joinConfig.channelId)?.members?.size ?? 0),
           audioBytes: ogg.length,
         };

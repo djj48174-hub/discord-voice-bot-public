@@ -41,6 +41,10 @@ const LOCK_TO_CHANNEL = String(process.env.LOCK_TO_CHANNEL || 'true').toLowerCas
 
 let autoRejoin = true;   // يتوقف لما تكتب /leave
 let joinTimer = null;    // مؤقت إعادة الدخول
+let lastJoinAt = 0;      // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
+
+// مهلة السماح لمحاولة الاتصال قبل ما نعتبرها فاشلة ونعيدها
+const JOIN_GRACE_MS = 20000;
 
 // ---------------------------------------------------------------------------
 // سجل بسيط
@@ -65,14 +69,26 @@ const client = new Client({
 const HEALTH_PORT = Number(process.env.PORT || 3000);
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
-    const conn = client.guilds.cache.first()?.voiceAdapterCreator ? 'connected' : 'disconnected';
+    const guild =
+      (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();
+    const conn = guild ? getVoiceConnection(guild.id) : null;
+    const inChannelId = guild?.members?.me?.voice?.channelId ?? null;
+    const ready = Boolean(conn) && conn.state.status === VoiceConnectionStatus.Ready;
+    const voice = ready && inChannelId ? 'connected' : inChannelId ? 'connecting' : 'disconnected';
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      bot: client.user?.tag ?? 'starting',
-      voice: conn,
-      uptime: process.uptime(),
-    }));
+    res.end(
+      JSON.stringify({
+        status: 'ok',
+        bot: client.user?.tag ?? 'starting',
+        gateway: client.isReady() ? 'ready' : 'offline',
+        voice,
+        channel: inChannelId
+          ? guild.channels.cache.get(inChannelId)?.name ?? inChannelId
+          : null,
+        uptime: Math.round(process.uptime()),
+      }),
+    );
   } else {
     res.writeHead(404);
     res.end('Not Found');
@@ -131,26 +147,35 @@ async function ensureConnected() {
   const guild = channel.guild;
   const conn = getVoiceConnection(guild.id);
 
-  // متصل أصلاً بالروم الصحيح -> ما نسوي شي
-  if (isConnectedTo(conn, channel.id)) return;
+  // مصدر الحقيقة: رأي ديسكورد نفسه عن مكان البوت
+  const meChannelId = guild.members.me?.voice?.channelId ?? null;
+  const ready = Boolean(conn) && conn.state.status === VoiceConnectionStatus.Ready;
 
-  // متصل بروم ثاني
-  if (conn && LOCK_TO_CHANNEL && conn.joinConfig.channelId !== channel.id) {
-    log('موجود في روم ثاني — أرجع للروم المحدد.');
+  // متصل فعلاً بالروم الصحيح -> ما نسوي شي
+  if (ready && meChannelId === channel.id) return;
+
+  // لسا داخل مهلة محاولة حديثة -> ننتظرها
+  if (Date.now() - lastJoinAt < JOIN_GRACE_MS) return;
+
+  log(
+    `⚠️ الاتصال غير سليم (state=${conn ? conn.state.status : 'لا يوجد'}, ` +
+      `في الروم=${meChannelId ?? 'لا'}) — أعيد الدخول للروم.`,
+  );
+
+  if (conn) {
     try {
-      conn.rejoin({ channelId: channel.id, selfDeaf: false, selfMute: false });
-      return;
-    } catch {
       conn.destroy();
+    } catch {
+      /* ignore */
     }
-  } else if (conn) {
-    conn.destroy();
   }
 
+  lastJoinAt = Date.now();
   connect(guild, channel);
 }
 
 function connect(guild, channel) {
+  lastJoinAt = Date.now();
   let conn;
   try {
     conn = joinVoiceChannel({
@@ -237,6 +262,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   // طلع من الروم (انفصل / طردوه)
   if (oldState.channelId && !newState.channelId) {
     log('⚠️ طلعت من الروم الصوتي — أحاول أرجع.');
+    lastJoinAt = 0; // نسمح بإعادة الدخول فوراً
     scheduleJoin(3000);
     return;
   }
@@ -248,7 +274,10 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     oldState.channelId !== newState.channelId
   ) {
     log(`نقلوني إلى روم ثاني: ${newState.channel?.name ?? newState.channelId}`);
-    if (LOCK_TO_CHANNEL) scheduleJoin(3000);
+    if (LOCK_TO_CHANNEL) {
+      lastJoinAt = 0; // نسمح بإعادة الدخول فوراً
+      scheduleJoin(3000);
+    }
   }
 });
 

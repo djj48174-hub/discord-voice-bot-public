@@ -12,7 +12,9 @@
 'use strict';
 
 const { spawn } = require('child_process');
+const { PassThrough } = require('stream');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const {
@@ -75,13 +77,129 @@ const IS_WIN = process.platform === 'win32';
 
 function extraYtdlpArgs() {
   const args = ['--no-warnings', '--no-check-certificates'];
-  if (process.env.YTDLP_COOKIES && fs.existsSync(process.env.YTDLP_COOKIES)) {
-    args.push('--cookies', process.env.YTDLP_COOKIES);
-  }
+  const cookieFile = cookieFilePath();
+  if (cookieFile) args.push('--cookies', cookieFile);
   if (process.env.YTDLP_EXTRA_ARGS) {
     args.push(...process.env.YTDLP_EXTRA_ARGS.split(' ').filter(Boolean));
   }
   return args;
+}
+
+// ---------------------------------------------------------------------------
+// تجاوز حجب يوتيوب ("Sign in to confirm you're not a bot")
+// نجرّب عدة "عملاء" (clients) بالترتيب، وأول واحد ينجح نعتمده.
+// ---------------------------------------------------------------------------
+const CLIENT_CANDIDATES = (
+  process.env.YTDLP_CLIENTS ||
+  'android,tv,android_vr,ios,mweb,tv_simply,web_embedded,web_safari,web,default'
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+let activeClient = (process.env.YTDLP_CLIENT || '').trim() || null;
+const clientResults = new Map(); // client -> true/false (نتيجة آخر تجربة)
+const STREAM_TIMEOUT_MS = Number(process.env.STREAM_TIMEOUT_MS || 15000);
+
+function clientArgs(client) {
+  if (!client || client === 'default') return [];
+  return ['--extractor-args', `youtube:player_client=${client}`];
+}
+
+/** ملف الكوكيز: إمّا مسار جاهز أو محتوى base64 في متغيّر البيئة */
+function cookieFilePath() {
+  const p = (process.env.YTDLP_COOKIES || '').trim();
+  if (p && fs.existsSync(p)) return p;
+
+  const b64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
+  if (b64) {
+    try {
+      const target = path.join(os.tmpdir(), 'yt-cookies.txt');
+      if (!fs.existsSync(target)) {
+        fs.writeFileSync(target, Buffer.from(b64, 'base64').toString('utf8'));
+      }
+      return target;
+    } catch (e) {
+      log('ما قدرت أكتب ملف الكوكيز:', e.message);
+    }
+  }
+  return null;
+}
+
+/** يجرّب عميلاً واحداً: هل يوصل فعلاً بايتات صوت؟ */
+function probeClient(client, testUrl) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok, why) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        proc.kill(IS_WIN ? undefined : 'SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      resolve({ client, ok, why });
+    };
+
+    const proc = spawn(
+      YTDLP,
+      [
+        '-f',
+        'bestaudio/best',
+        '-o',
+        '-',
+        '--no-playlist',
+        '--no-part',
+        '--no-progress',
+        ...clientArgs(client),
+        ...extraYtdlpArgs(),
+        testUrl,
+      ],
+      { windowsHide: true },
+    );
+
+    let err = '';
+    proc.stderr.on('data', (d) => {
+      err += d.toString();
+      if (err.length > 2000) err = err.slice(-1200);
+    });
+    proc.stdout.once('data', () => finish(true));
+    proc.on('error', (e) => finish(false, e.message));
+    proc.on('close', (code) => {
+      const last = err.split('\n').map((s) => s.trim()).filter(Boolean).pop();
+      finish(false, last || `exit ${code}`);
+    });
+
+    const timer = setTimeout(() => finish(false, 'انتهت المدة'), STREAM_TIMEOUT_MS);
+  });
+}
+
+/**
+ * يفحص العملاء بالترتيب ويختار أول واحد يشتغل.
+ */
+async function ensureWorkingClient(force = false) {
+  if (!force && activeClient && clientResults.get(activeClient) === true) return activeClient;
+
+  const testUrl = process.env.YTDLP_PROBE_URL || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  const order = activeClient
+    ? [activeClient, ...CLIENT_CANDIDATES.filter((c) => c !== activeClient)]
+    : CLIENT_CANDIDATES;
+
+  for (const client of order) {
+    if (!force && clientResults.get(client) === false) continue;
+    const r = await probeClient(client, testUrl);
+    clientResults.set(client, r.ok);
+    if (r.ok) {
+      activeClient = client;
+      log(`✅ عميل يوتيوب شغّال: ${client}`);
+      return client;
+    }
+    log(`❌ عميل يوتيوب فاشل: ${client} — ${r.why || ''}`);
+  }
+  log('⚠️ كل عملاء يوتيوب فشلوا — السيرفر يحتاج كوكيز.');
+  activeClient = null;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,10 +296,21 @@ async function resolveQuery(query, maxPlaylist = 25) {
 // ---------------------------------------------------------------------------
 // بث الصوت: yt-dlp -> ffmpeg (Ogg Opus)
 // ---------------------------------------------------------------------------
-function createAudioStream(url, volume) {
+function createAudioStream(url, volume, client = null) {
   const ytdlp = spawn(
     YTDLP,
-    ['-f', 'bestaudio/best', '-o', '-', '--no-playlist', '--no-part', '--no-progress', ...extraYtdlpArgs(), url],
+    [
+      '-f',
+      'bestaudio/best',
+      '-o',
+      '-',
+      '--no-playlist',
+      '--no-part',
+      '--no-progress',
+      ...clientArgs(client),
+      ...extraYtdlpArgs(),
+      url,
+    ],
     { windowsHide: true },
   );
 
@@ -255,6 +384,7 @@ class GuildMusic {
     this.volume = Math.max(0, Math.min(1, Number(process.env.DEFAULT_VOLUME || 70) / 100));
     this.connection = null;
     this.currentStream = null;
+    this.textChannel = null;
     this.startedAt = 0;
     this.repeat = false;          // تكرار الأغنية الحالية
     this._suppressRepeat = false; // نتجاهل التكرار لما نتخطى أو نغيّر الصوت
@@ -300,7 +430,16 @@ class GuildMusic {
 
     this.current = null;
     this._didPlay = false;
-    setTimeout(() => this.playNext(), 200);
+    setTimeout(() => {
+      this.playNext().then((r) => {
+        if (r && !r.ok && !r.empty) {
+          this.notify(
+            '❌ ما قدرت أشغّل الأغنية اللي بعدها.\n' +
+              'غالباً يوتيوب حاجب السيرفر حالياً — جرّب مرة ثانية بعد شوي.',
+          );
+        }
+      });
+    }, 200);
   }
 
   attach(connection) {
@@ -308,31 +447,110 @@ class GuildMusic {
     connection.subscribe(this.player);
   }
 
-  play(song) {
-    this.current = song;
-    this.startedAt = Date.now();
-    this._didPlay = false;
+  /**
+   * يشغّل أغنية، ويجرّب كل عملاء يوتيوب بالترتيب لين ينجح واحد.
+   * يرجّع true فقط لو وصل صوت حقيقي فعلاً.
+   */
+  async play(song) {
+    const order = activeClient
+      ? [activeClient, ...CLIENT_CANDIDATES.filter((c) => c !== activeClient)]
+      : CLIENT_CANDIDATES;
 
-    const { stream, kill } = createAudioStream(song.url, this.volume);
-    this.currentStream = { kill };
+    const tried = [];
+    for (const client of order) {
+      if (clientResults.get(client) === false) continue; // فشل قبل كذا — نتخطاه
+      tried.push(client);
+      const ok = await this._tryPlay(song, client);
+      clientResults.set(client, ok);
+      if (ok) {
+        if (client !== activeClient) {
+          activeClient = client;
+          log(`✅ اعتمدت عميل يوتيوب: ${client}`);
+        }
+        return true;
+      }
+      log(`↩️ العميل ${client} ما نجح — أجرّب غيره`);
+    }
 
-    const resource = createAudioResource(stream, { inputType: StreamType.OggOpus });
-    this.player.play(resource);
-    log(`▶️ تشغيل: ${song.title}`);
+    // لو كلهم مسجّلين فشل، نصفّر النتائج ونعيد المحاولة مرة واحدة
+    if (!tried.length) {
+      log('كل العملاء مسجّلين فشل — أعيد الفحص من جديد');
+      clientResults.clear();
+      activeClient = null;
+      return this.play(song);
+    }
+    return false;
   }
 
-  playNext() {
+  /** محاولة تشغيل واحدة بعميل محدّد — يرجّع true لو وصل أول بايت صوت */
+  _tryPlay(song, client) {
+    return new Promise((resolve) => {
+      this.current = song;
+      this.startedAt = Date.now();
+      this._didPlay = false;
+
+      const { stream, kill } = createAudioStream(song.url, this.volume, client);
+
+      let settled = false;
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(val);
+      };
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        log(`⏱️ العميل ${client}: ما وصل صوت خلال ${Math.round(STREAM_TIMEOUT_MS / 1000)} ثانية`);
+        try {
+          kill();
+        } catch {
+          /* ignore */
+        }
+        finish(false);
+      }, STREAM_TIMEOUT_MS);
+
+      // ننتظر أول بايت صوت حقيقي قبل ما نعتبر إنها اشتغلت
+      stream.once('data', (chunk) => {
+        if (settled) return;
+        clearTimeout(timer);
+
+        const pt = new PassThrough();
+        pt.write(chunk);
+        stream.pipe(pt);
+
+        this.currentStream = { kill };
+        const resource = createAudioResource(pt, { inputType: StreamType.OggOpus });
+        this.player.play(resource);
+        log(`▶️ تشغيل: ${song.title}  (client=${client})`);
+        finish(true);
+      });
+
+      const bail = () => {
+        if (settled) return;
+        try {
+          kill();
+        } catch {
+          /* ignore */
+        }
+        finish(false);
+      };
+      stream.once('end', bail);
+      stream.once('error', bail);
+      stream.once('close', bail);
+    });
+  }
+
+  /** يشغّل اللي بعدها ويرجّع { ok, empty, song } */
+  async playNext() {
     if (!this.songs.length) {
       this.current = null;
-      return;
+      return { ok: false, empty: true };
     }
     const next = this.songs.shift();
-    try {
-      this.play(next);
-    } catch (err) {
-      log('فشل تشغيل الأغنية:', err.message);
-      this.playNext();
-    }
+    const ok = await this.play(next);
+    if (!ok) log(`❌ ما قدرت أشغّل: ${next.title}`);
+    return { ok, empty: false, song: next };
   }
 
   /** يستمع لحالة المشغّل ويرجّع true أول ما يبدأ التشغيل فعلياً */
@@ -360,10 +578,24 @@ class GuildMusic {
   }
 
   /** يشغّل اللي بعدها وينتظر النتيجة: true = اشتغلت، false = فشلت */
-  startAndWait(timeoutMs = 20000) {
-    const wait = this.waitForPlaying(timeoutMs);
-    this.playNext();
-    return wait;
+  async startAndWait(timeoutMs = 25000) {
+    const r = await this.playNext();
+    if (!r.ok) return false;
+    return this.waitForPlaying(timeoutMs);
+  }
+
+  /** حفظ قناة نصية لإرسال التنبيهات */
+  setTextChannel(ch) {
+    this.textChannel = ch || null;
+  }
+
+  /** يرسل تنبيه للقناة النصية (إن وُجدت) */
+  notify(text) {
+    try {
+      if (this.textChannel) this.textChannel.send(text).catch(() => {});
+    } catch {
+      /* ignore */
+    }
   }
 
   skip() {
@@ -590,6 +822,8 @@ async function handleInteraction(interaction, opts) {
     }
 
     const { music: m } = getOrCreateConnection(guild, channel);
+    m.setTextChannel(interaction.channel);
+    music.setTextChannel(interaction.channel);
 
     // هل كان في شي شغّال قبل ما يضيف؟
     const wasIdle = !m.current;
@@ -619,7 +853,7 @@ async function handleInteraction(interaction, opts) {
           : `🔎 جاري تشغيل **${resolved.songs[0].title}** ...`,
       );
 
-      const started = await m.startAndWait(25000);
+      const started = await m.startAndWait(60000);
 
       if (started && m.current) {
         await interaction.editReply({
@@ -749,4 +983,7 @@ module.exports = {
   resolveQuery,
   formatDuration,
   diagnostics,
+  ensureWorkingClient,
+  getActiveClient: () => activeClient,
+  createAudioStream,
 };

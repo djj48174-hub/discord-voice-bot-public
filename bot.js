@@ -251,6 +251,10 @@ client.once('ready', async () => {
     log('تنبيه: فحص أدوات الموسيقى فشل:', e.message);
   }
 
+  // فحص عملاء يوتيوب بالخلفية واختيار أول واحد شغّال
+  // (يتجاوز حجب "Sign in to confirm you're not a bot")
+  music.ensureWorkingClient().catch((e) => log('تنبيه: فحص عملاء يوتيوب فشل:', e.message));
+
   if (VOICE_CHANNEL_ID) {
     await ensureConnected();
   } else {

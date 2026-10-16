@@ -431,15 +431,20 @@ class GuildMusic {
     this.current = null;
     this._didPlay = false;
     setTimeout(() => {
-      this.playNext().then((r) => {
-        if (r && !r.ok && !r.empty) {
-          this.notify(
-            '❌ ما قدرت أشغّل الأغنية اللي بعدها.\n' +
-              'غالباً يوتيوب حاجب السيرفر حالياً — جرّب مرة ثانية بعد شوي.',
-          );
-        }
-      });
+      this._drainQueue().catch((e) => log('خطأ في تشغيل الطابور:', e.message));
     }, 200);
+  }
+
+  /** يشغّل من الطابور لين ينجح، بحد أقصى 3 محاولات (عشان ما يعلق بالحجب) */
+  async _drainQueue(maxAttempts = 3) {
+    for (let i = 0; i < maxAttempts; i++) {
+      const r = await this.playNext();
+      if (r.ok || r.empty) return;
+    }
+    this.notify(
+      '❌ ما قدرت أشغّل الأغاني المتبقية.\n' +
+        'غالباً يوتيوب حاجب السيرفر حالياً — جرّب `/play` مرة ثانية بعد شوي.',
+    );
   }
 
   attach(connection) {
@@ -479,6 +484,9 @@ class GuildMusic {
       activeClient = null;
       return this.play(song);
     }
+
+    this.current = null;
+    this.currentStream = null;
     return false;
   }
 

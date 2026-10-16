@@ -92,7 +92,11 @@ const healthServer = http.createServer(async (req, res) => {
     }
     log('[diag] طلب فحص المصادر…');
     try {
-      const data = await music.diagnose();
+      const u = new URL(req.url, 'http://localhost');
+      const data = await music.diagnose({
+        query: u.searchParams.get('q') || '',
+        vids: u.searchParams.get('vids') || '',
+      });
       log('[diag] تم الفحص');
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));

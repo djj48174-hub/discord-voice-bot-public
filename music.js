@@ -1040,9 +1040,14 @@ function probeDownload(extraArgs, timeoutMs = 15000) {
 }
 
 /** يفحص كل عملاء يوتيوب + ساوند كلاود من هذا السيرفر */
-async function diagnose(extraQuery = process.env.DIAG_QUERY || '') {
+async function diagnose(opts = {}) {
   const ytUrl = process.env.YTDLP_PROBE_URL || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   const clients = [...new Set([...CLIENT_CANDIDATES, 'default'])];
+  const q = opts.query || process.env.DIAG_QUERY || 'music';
+  const vids = String(opts.vids || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 
   const youtube = await Promise.all(
     clients.map(async (c) => {
@@ -1051,39 +1056,47 @@ async function diagnose(extraQuery = process.env.DIAG_QUERY || '') {
     }),
   );
 
+  // نفس الأغاني اللي فشلت عند المستخدم (بالعميل الافتراضي)
+  const userVideos = [];
+  for (const v of vids) {
+    const r = await probeDownload([`https://www.youtube.com/watch?v=${v}`], 20000);
+    userVideos.push({ vid: v, ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why });
+  }
+
   // ساوند كلاود: بحث ثم تحميل
-  const q = extraQuery || 'music';
-  const scSearch = await probeDownload(['--dump-single-json', '--flat-playlist', `scsearch3:${q}`], 15000);
+  const scSearch = await probeDownload(['--dump-single-json', '--flat-playlist', `scsearch3:${q}`], 20000);
   let scTitle = null;
   let scUrl = null;
-  let scResult = { ok: false, why: 'البحث فشل' };
+  let scResult = { ok: false, why: 'ما فيه نتيجة' };
 
   if (scSearch.ok) {
     try {
-      const j = JSON.parse(scSearch.stdout || '{}');
+      const j = JSON.parse(scSearch.out || '{}');
       const e = (j.entries || []).filter(Boolean)[0];
       if (e) {
         scTitle = e.title || null;
         scUrl = e.url || e.webpage_url || null;
       }
-    } catch {
-      /* ignore */
+    } catch (e) {
+      scResult = { ok: false, why: `قراءة النتيجة فشلت: ${e.message}` };
     }
   }
 
   if (scUrl) {
-    const r = await probeDownload([scUrl], 15000);
-    scResult = { ok: r.ok, bytes: r.bytes, why: r.why };
+    const r = await probeDownload([scUrl], 20000);
+    scResult = { ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why };
   }
 
   return {
     at: new Date().toISOString(),
     cookies: Boolean(cookieFilePath()),
-    ytdlpVersion: YTDLP,
+    activeClient,
+    userVideos,
     youtube,
     soundcloud: {
       searchQuery: q,
       searchOk: scSearch.ok,
+      searchWhy: scSearch.ok ? '' : scSearch.why,
       firstTitle: scTitle,
       firstUrl: scUrl,
       download: scResult,

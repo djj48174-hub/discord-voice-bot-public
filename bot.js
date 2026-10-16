@@ -166,8 +166,13 @@ function connect(guild, channel) {
     return;
   }
 
+  let lastReadyLog = 0;
   conn.on(VoiceConnectionStatus.Ready, () => {
-    log(`✅ دخلت الروم الصوتي: ${channel.name}`);
+    // نمنع تكرار الرسالة (بروتوكول DAVE يعيد التفاوض أكثر من مرة)
+    if (Date.now() - lastReadyLog > 10000) {
+      log(`✅ دخلت الروم الصوتي: ${channel.name}`);
+      lastReadyLog = Date.now();
+    }
     // نربط مشغّل الموسيقى بالاتصال عشان يشتغل الصوت
     try {
       music.attachPlayerToConnection(guild.id, conn);
@@ -264,6 +269,17 @@ async function registerCommands() {
         body: commands,
       });
       log(`تم تسجيل الأوامر في السيرفر ${GUILD_ID}.`);
+
+      // نمسح أي أوامر عامة قديمة متروكة (مثل /music) عشان ما تلخبط المستخدم
+      try {
+        const existing = await client.rest.get(Routes.applicationCommands(client.user.id));
+        if (Array.isArray(existing) && existing.length) {
+          await client.rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+          log(`تم مسح ${existing.length} أمر عام قديم (${existing.map((c) => '/' + c.name).join(', ')}).`);
+        }
+      } catch (e) {
+        log('تنبيه: ما قدرت أمسح الأوامر العامة:', e.message);
+      }
     } else {
       await client.rest.put(Routes.applicationCommands(client.user.id), { body: commands });
       log('تم تسجيل الأوامر عالميًا (قد تأخذ وقت لتظهر).');

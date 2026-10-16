@@ -395,17 +395,29 @@ async function runMusicFromChat(message, text) {
 const BOT_ROLE_NAME = (process.env.BOT_ROLE_NAME || 'بوت 24/7').trim();
 const BOT_ROLE_COLOR = (process.env.BOT_ROLE_COLOR || '#5865F2').trim();
 
+// الصلاحيات في رابط الدعوة (تشمل "إدارة الرتب" عشان يقدر يضبط رتبته)
+const INVITE_PERMS = 271961120;
+const botRolePending = new Set(); // سيرفرات باقي ما ضبطنا رتبتها
+
+function inviteUrl() {
+  if (!client.user) return '';
+  return (
+    `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}` +
+    `&permissions=${INVITE_PERMS}&scope=bot%20applications.commands`
+  );
+}
+
 async function ensureBotRole(guild) {
   if (!BOT_ROLE_NAME) return null;
   try {
     const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
     if (!me) return null;
 
-    let role = guild.roles.cache.find((r) => r.name === BOT_ROLE_NAME);
+    let role = guild.roles.cache.find((r) => r.name === BOT_ROLE_NAME && !r.managed);
     if (!role) {
       role = await guild.roles.create({
         name: BOT_ROLE_NAME,
-        color: BOT_ROLE_COLOR,
+        colors: { primaryColor: BOT_ROLE_COLOR },
         hoist: false,
         mentionable: false,
         reason: 'رتبة البوت الرسمية',
@@ -417,12 +429,20 @@ async function ensureBotRole(guild) {
       await me.roles.add(role, 'رتبة البوت');
       log(`🎖️ أعطيت البوت الرتبة: ${BOT_ROLE_NAME}`);
     }
+
+    botRolePending.delete(guild.id);
     return role;
   } catch (e) {
-    log(
-      `⚠️ ما قدرت أضبط رتبة البوت (${BOT_ROLE_NAME}): ${e.message}\n` +
-        '   الحل: من إعدادات السيرفر → الرتب → اسحب رتبة البوت فوق، أو أعطِ البوت صلاحية "إدارة الرتب".',
-    );
+    if (!botRolePending.has(guild.id)) {
+      botRolePending.add(guild.id);
+      log(
+        `⚠️ ما قدرت أضبط رتبة البوت (${BOT_ROLE_NAME}): ${e.message}\n` +
+          '   ديسكورد يمنع البوت يرفع نفسه — سوِّ هالخطوتين وبعدها يصير تلقائي:\n' +
+          '   1) افتح هذا الرابط ووافق (يعطي البوت صلاحية إدارة الرتب):\n' +
+          `      ${inviteUrl()}\n` +
+          `   2) إعدادات السيرفر → الرتب → اسحب رتبة البوت فوق باقي الرتب.`,
+      );
+    }
     return null;
   }
 }
@@ -640,6 +660,14 @@ setInterval(() => {
     }
   } catch {
     /* ignore */
+  }
+
+  // إعادة محاولة ضبط رتبة البوت لو فشلت (لين يصلّح المستخدم الصلاحيات)
+  if (botRolePending.size) {
+    for (const id of [...botRolePending]) {
+      const g = client.guilds.cache.get(id);
+      if (g) ensureBotRole(g).catch(() => {});
+    }
   }
 }, CHECK_MS);
 

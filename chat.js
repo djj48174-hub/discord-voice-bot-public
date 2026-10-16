@@ -21,7 +21,8 @@ function log(...args) {
 const API_KEY = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
 
 const MODELS = (
-  process.env.GEMINI_MODEL || 'gemini-2.5-flash,gemini-2.0-flash,gemini-flash-latest'
+  process.env.GEMINI_MODEL ||
+  'gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-flash-latest'
 )
   .split(',')
   .map((s) => s.trim())
@@ -155,8 +156,15 @@ async function askAI(key, text, userLabel) {
   for (const model of models) {
     // نجرب أولاً مع تعطيل "التفكير" (أسرع بكثير في المحادثة)
     const attempts = [];
-    attempts.push({ ...base, generationConfig: { ...base.generationConfig, thinkingConfig: { thinkingBudget: 0 } } });
-    attempts.push(base);
+    attempts.push({
+      ...base,
+      generationConfig: { ...base.generationConfig, thinkingConfig: { thinkingBudget: 0 } },
+    });
+    // محاولة ثانية: التفكير الافتراضي — نوسّع الحد عشان ما يستهلكه التفكير
+    attempts.push({
+      ...base,
+      generationConfig: { ...base.generationConfig, maxOutputTokens: 2048 },
+    });
 
     for (const body of attempts) {
       try {

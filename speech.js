@@ -65,19 +65,83 @@ function ffmpegPath() {
 }
 
 // ---------------------------------------------------------------------------
-// TTS — تحويل النص إلى صوت (WebM Opus)
+// TTS — تحويل النص إلى صوت (Ogg Opus 48kHz ستيريو — نفس صيغة الموسيقى)
 // ---------------------------------------------------------------------------
-/** يرجّع ستريم WebM Opus صالح للتشغيل مباشرة في ديسكورد */
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (d) => chunks.push(d));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+/** WebM Opus (24kHz مونو من مايكروسوفت) -> Ogg Opus (48kHz ستيريو — ما يقبله ديسكورد) */
+function webmToOgg(webm) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(
+      ffmpegPath(),
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        'pipe:0',
+        '-c:a',
+        'libopus',
+        '-b:a',
+        '96k',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
+        '-f',
+        'ogg',
+        'pipe:1',
+      ],
+      { windowsHide: true },
+    );
+
+    const out = [];
+    const err = [];
+    ff.stdout.on('data', (d) => out.push(d));
+    ff.stderr.on('data', (d) => err.push(d));
+    ff.on('error', reject);
+    ff.on('close', (code) => {
+      const buf = Buffer.concat(out);
+      if (code !== 0 || buf.length < 200) {
+        reject(
+          new Error(
+            `تحويل الصوت فشل: ${Buffer.concat(err).toString().trim().slice(0, 200) || 'exit ' + code}`,
+          ),
+        );
+        return;
+      }
+      resolve(buf);
+    });
+    ff.stdin.on('error', () => {});
+    ff.stdin.end(webm);
+  });
+}
+
+/**
+ * يرجّع صوتاً (Ogg Opus 48kHz ستيريو) جاهزاً للتشغيل في ديسكورد مباشرة.
+ * صوت Edge TTS عربي + سرعة أعلى شوي عشان ما يطوّل.
+ */
 async function speak(text, opts = {}) {
   const clean = String(text || '').trim();
   if (!clean) throw new Error('ما فيه نص للنطق');
 
   const tts = new MsEdgeTTS();
   await tts.setMetadata(opts.voice || nextVoice(), OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-
   const { audioStream } = await tts.toStream(clean, { rate: opts.rate || TTS_RATE });
-  if (!audioStream) throw new Error('ما رجع صوت من محرّك النطق');
-  return audioStream;
+
+  const webm = await streamToBuffer(audioStream);
+  if (webm.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
+
+  const ogg = await webmToOgg(webm);
+  log(`🔊 صوت جاهز: ${ogg.length} بايت`);
+  return ogg;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,15 +238,9 @@ async function selfTest() {
   const out = { tts: null, stt: null };
 
   try {
-    const stream = await speak('تمام', { voice: TTS_VOICE });
-    const buf = await new Promise((res, rej) => {
-      const c = [];
-      stream.on('data', (d) => c.push(d));
-      stream.on('end', () => res(Buffer.concat(c)));
-      stream.on('error', rej);
-    });
-    out.tts = { ok: buf.length > 1000, bytes: buf.length, voice: TTS_VOICE };
-    log(`✅ النطق يشتغل (${TTS_VOICE}): ${buf.length} بايت`);
+    const ogg = await speak('تمام', { voice: TTS_VOICE });
+    out.tts = { ok: ogg.length > 1000, bytes: ogg.length, voice: TTS_VOICE };
+    log(`✅ النطق يشتغل (${TTS_VOICE}): ${ogg.length} بايت (Ogg Opus 48kHz)`);
   } catch (e) {
     out.tts = { ok: false, error: e.message };
     log('❌ النطق فشل:', e.message.slice(0, 120));
@@ -193,13 +251,20 @@ async function selfTest() {
   } else {
     // نختبر التفريغ بملف صوت نولّده من TTS
     try {
-      const stream = await speak('مرحبا، هذا اختبار للصوت.', { voice: TTS_VOICE });
       const webm = await new Promise((res, rej) => {
-        const c = [];
-        stream.on('data', (d) => c.push(d));
-        stream.on('end', () => res(Buffer.concat(c)));
-        stream.on('error', rej);
+        const tts = new MsEdgeTTS();
+        (async () => {
+          await tts.setMetadata(TTS_VOICE, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+          const { audioStream } = await tts.toStream('مرحبا، هذا اختبار للصوت.');
+          return audioStream;
+        })().then((s) => {
+          const c = [];
+          s.on('data', (d) => c.push(d));
+          s.on('end', () => res(Buffer.concat(c)));
+          s.on('error', rej);
+        }, rej);
       });
+
       const { WebmDemuxer } = require('prism-media').opus;
       const packets = [];
       const demuxer = new WebmDemuxer();
@@ -209,6 +274,7 @@ async function selfTest() {
         demuxer.on('error', rej);
         demuxer.end(webm);
       });
+
       const r = await transcribe(packets, { language: 'ar' });
       out.stt = { ok: true, text: r.text, model: STT_MODEL };
       log(`✅ التفريغ يشتغل (${STT_MODEL}): "${r.text}"`);

@@ -12,7 +12,7 @@
 'use strict';
 
 const { spawn } = require('child_process');
-const { PassThrough } = require('stream');
+const { PassThrough, Readable } = require('stream');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -798,9 +798,9 @@ class GuildMusic {
   }
 
   /**
-   * ينطق نصاً (ستريم WebM Opus من msedge-tts) ويرجّع true لو اشتغل.
+   * ينطق نصاً (Ogg Opus 48kHz — نفس صيغة الموسيقى) ويرجّع true لو اشتغل.
    */
-  speak(webmStream, volume = 1) {
+  speak(oggBuffer, volume = 1) {
     this.pauseForVoice();
     return new Promise((resolve) => {
       let done = false;
@@ -818,8 +818,8 @@ class GuildMusic {
       const timer = setTimeout(() => finish(false), 90000);
 
       try {
-        const resource = createAudioResource(webmStream, {
-          inputType: StreamType.WebmOpus,
+        const resource = createAudioResource(Readable.from(oggBuffer), {
+          inputType: StreamType.OggOpus,
           inlineVolume: true,
         });
         if (volume !== 1) resource.volume.setVolume(volume);

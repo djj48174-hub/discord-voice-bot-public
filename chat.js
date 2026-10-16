@@ -37,7 +37,10 @@ const GEMINI_MODELS = list(
     'gemini-3.5-flash-lite,gemini-flash-latest,gemini-flash-lite-latest,gemini-3.7-flash',
 );
 
-let groqModels = list(process.env.GROQ_MODEL, 'llama-3.3-70b-versatile,llama-3.1-8b-instant');
+let groqModels = list(
+  process.env.GROQ_MODEL,
+  'qwen/qwen3.8-27b,openai/gpt-oss-120b,allam-2-7b,openai/gpt-oss-20b',
+);
 let groqDiscovered = false;
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
@@ -300,12 +303,12 @@ async function discoverGroq() {
     const data = await res.json();
     const ids = (data?.data || [])
       .map((m) => m.id)
-      .filter((id) => typeof id === 'string' && !/(whisper|tts|guard|embed|moderation)/i.test(id));
+      .filter((id) => typeof id === 'string' && !/(whisper|tts|guard|embed|moderation|orpheus)/i.test(id));
     if (!ids.length) return;
 
     const preferred = groqModels.filter((m) => ids.includes(m));
     const rest = ids.filter(
-      (id) => !preferred.includes(id) && /(llama|qwen|gemma|mixtral|kimi|gpt-oss|deepseek|mistral)/i.test(id),
+      (id) => !preferred.includes(id) && /(llama|qwen|gemma|mixtral|kimi|gpt-oss|deepseek|mistral|allam)/i.test(id),
     );
     groqModels = [...preferred, ...rest];
     log(`🔎 موديلات Groq المتاحة: ${groqModels.slice(0, 6).join(', ')}${groqModels.length > 6 ? ' …' : ''}`);

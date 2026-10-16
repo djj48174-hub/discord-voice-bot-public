@@ -211,6 +211,13 @@ client.once('ready', async () => {
 
   await registerCommands();
 
+  // فحص أدوات الموسيقى (yt-dlp + ffmpeg)
+  try {
+    music.diagnostics();
+  } catch (e) {
+    log('تنبيه: فحص أدوات الموسيقى فشل:', e.message);
+  }
+
   if (VOICE_CHANNEL_ID) {
     await ensureConnected();
   } else {

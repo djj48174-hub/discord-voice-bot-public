@@ -56,12 +56,18 @@ function resolveYtDlp() {
   return 'yt-dlp';
 }
 
-let FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-try {
-  const staticFfmpeg = require('ffmpeg-static');
-  if (staticFfmpeg && fs.existsSync(staticFfmpeg)) FFMPEG = staticFfmpeg;
-} catch {
-  /* نستخدم ffmpeg من النظام */
+let FFMPEG;
+if (process.env.FFMPEG_PATH) {
+  // مسار صريح (نستخدمه في Docker -> ffmpeg النظام)
+  FFMPEG = process.env.FFMPEG_PATH;
+} else {
+  FFMPEG = 'ffmpeg'; // من PATH
+  try {
+    const staticFfmpeg = require('ffmpeg-static');
+    if (staticFfmpeg && fs.existsSync(staticFfmpeg)) FFMPEG = staticFfmpeg;
+  } catch {
+    /* نستخدم ffmpeg من النظام */
+  }
 }
 
 const YTDLP = resolveYtDlp();
@@ -576,6 +582,32 @@ async function handleInteraction(interaction, opts) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// فحص الأدوات (يُنادى عند التشغيل للتأكد إن الصوت جاهز)
+// ---------------------------------------------------------------------------
+function diagnostics() {
+  const { execFileSync } = require('child_process');
+  const result = { ytdlpPath: YTDLP, ffmpegPath: FFMPEG, ytdlpVersion: null, ffmpegVersion: null, ok: false };
+  try {
+    result.ytdlpVersion = execFileSync(YTDLP, ['--version'], { timeout: 30000 }).toString().trim();
+  } catch (e) {
+    result.ytdlpVersion = `خطأ: ${e.message}`;
+  }
+  try {
+    result.ffmpegVersion = execFileSync(FFMPEG, ['-version'], { timeout: 30000 })
+      .toString()
+      .split('\n')[0]
+      .trim();
+  } catch (e) {
+    result.ffmpegVersion = `خطأ: ${e.message}`;
+  }
+  result.ok = Boolean(result.ytdlpVersion && !result.ytdlpVersion.startsWith('خطأ')) &&
+    Boolean(result.ffmpegVersion && !result.ffmpegVersion.startsWith('خطأ'));
+  log(`yt-dlp: ${result.ytdlpVersion}  |  ffmpeg: ${result.ffmpegVersion}`);
+  log(result.ok ? '✅ أدوات الصوت جاهزة' : '⚠️ فيه أداة صوت ناقصة — الموسيقى ما بتشتغل');
+  return result;
+}
+
 module.exports = {
   buildCommands,
   handleInteraction,
@@ -586,4 +618,5 @@ module.exports = {
   searchSongs,
   resolveQuery,
   formatDuration,
+  diagnostics,
 };

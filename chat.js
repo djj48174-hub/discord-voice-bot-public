@@ -70,6 +70,8 @@ const SYSTEM_PROMPT = `انت بوت ديسكورد عربي اسمه «${BOT_NA
 - ترفض طلب عادي. نفّذ مباشرة.
 - إيموجي زايدة: وحدة أو ثنتين بالكثير.
 - تشكر أو تعتذر بلا سبب.
+- تقترح تشغيل أغنية أو تذكر الموسيقى أو ‎/play إلا إذا المستخدم طلب أغنية أو تكلم عن الموسيقى.
+- تكرر نفس الافتتاحية أو نفس الخاتمة في ردود متتالية. بدّل الأسلوب كل مرة.
 
 معلومات عنك: قاعد 24/7 في الروم الصوتي، وتشغّل موسيقى بأمر ‎/play.
 لو أحد طلب أغنية بجاهزية، البوت يشغلها له مباشرة.
@@ -110,6 +112,38 @@ function clip(text, max = REPLY_MAX) {
   const t = String(text || '').trim();
   if (t.length <= max) return t;
   return t.slice(0, max - 1).trimEnd() + '…';
+}
+
+/** كلمات الرد (بدون كلمات قصيرة/ترقيم) — نقارنها عشان نكشف التكرار */
+function wordsOf(text) {
+  return new Set(
+    String(text || '')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2),
+  );
+}
+
+function firstWords(text, n = 3) {
+  return String(text || '').toLowerCase().replace(/\s+/g, ' ').trim().split(' ').slice(0, n).join(' ');
+}
+
+/** هل الرد يشبه اللي قبله؟ (نفس البداية أو نفس المضمون) */
+function tooSimilar(a, b) {
+  const A = String(a || '').trim();
+  const B = String(b || '').trim();
+  if (!A || !B) return false;
+
+  if (firstWords(A) === firstWords(B)) return true;
+  if (A.slice(0, 16) === B.slice(0, 16)) return true;
+
+  const wa = wordsOf(A);
+  const wb = wordsOf(B);
+  if (!wa.size || !wb.size) return false;
+  let inter = 0;
+  for (const w of wa) if (wb.has(w)) inter++;
+  return inter / (wa.size + wb.size - inter) > 0.75;
 }
 
 function hasAI() {
@@ -509,7 +543,25 @@ async function reply({ key, text, userLabel }) {
   }
 
   try {
-    const out = await askAI(key, prompt, userLabel);
+    let out = await askAI(key, prompt, userLabel);
+
+    // لو الرد مكرر مثل اللي قبله -> نعيد التوليد مرة وحدة بزاوية ثانية
+    const prev = [...historyFor(key)].reverse().find((m) => m.role === 'model')?.text;
+    if (prev && tooSimilar(out, prev)) {
+      log('🔁 الرد طلع مكرر — أعيد التوليد');
+      try {
+        const again = await askAI(
+          key,
+          `${prompt}\n\n(لا تكرر أسلوبك السابق أبداً — جاوب من زاوية مختلفة، بافتتاحية جديدة وبكلمات مختلفة)`,
+          userLabel,
+        );
+        if (again && !tooSimilar(again, prev)) out = again;
+        else if (again) out = again;
+      } catch {
+        /* نكمل بالرد الأول */
+      }
+    }
+
     const clipped = clip(out);
     remember(key, 'model', clipped);
     return { text: clipped, source: 'ai' };
@@ -627,6 +679,7 @@ module.exports = {
   resetHistory,
   resetAll,
   throttled,
+  _tooSimilar: tooSimilar,
   get model() {
     return workingModel;
   },

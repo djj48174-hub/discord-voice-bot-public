@@ -459,6 +459,7 @@ class GuildMusic {
     this.startedAt = 0;
     this.repeat = false;          // تكرار الأغنية الحالية
     this._suppressRepeat = false; // نتجاهل التكرار لما نتخطى أو نغيّر الصوت
+    this._voicePaused = false;    // الموسيقى موقوفة مؤقتاً عشان البوت يرد صوتياً
     this._didPlay = false;        // هل الأغنية الحالية اشتغلت فعلاً؟
     this._lastEndedAt = 0;
 
@@ -764,6 +765,91 @@ class GuildMusic {
   toggleLoop(force) {
     this.repeat = typeof force === 'boolean' ? force : !this.repeat;
     return this.repeat;
+  }
+
+  // -------------------------------------------------------------------------
+  // الرد الصوتي: يوقف الموسيقى، ينطق الرد، وبعدها يرجع الموسيقى
+  // -------------------------------------------------------------------------
+  pauseForVoice() {
+    this._voicePaused = true;
+    const st = this.player.state.status;
+    if (st === AudioPlayerStatus.Playing || st === AudioPlayerStatus.Paused) {
+      try {
+        this.player.pause();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  resumeAfterVoice() {
+    if (!this._voicePaused) return;
+    this._voicePaused = false;
+    if (!this.current) return;
+    // المورد الصوتي ما يرجع بعد الإيقاف — نعيد الأغنية من البداية
+    this.songs.unshift(this.current);
+    this._suppressRepeat = true;
+    try {
+      this.player.stop(true);
+    } catch {
+      /* ignore */
+    }
+    this.playNext();
+  }
+
+  /**
+   * ينطق نصاً (ستريم WebM Opus من msedge-tts) ويرجّع true لو اشتغل.
+   */
+  speak(webmStream, volume = 1) {
+    this.pauseForVoice();
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.player.off(AudioPlayerStatus.Idle, onIdle);
+        this.resumeAfterVoice();
+        resolve(ok);
+      };
+
+      const onIdle = () => finish(true);
+      this.player.once(AudioPlayerStatus.Idle, onIdle);
+      const timer = setTimeout(() => finish(false), 90000);
+
+      try {
+        const resource = createAudioResource(webmStream, {
+          inputType: StreamType.WebmOpus,
+          inlineVolume: true,
+        });
+        if (volume !== 1) resource.volume.setVolume(volume);
+        this.player.play(resource);
+      } catch (e) {
+        log('⚠️ فشل النطق:', e.message);
+        finish(false);
+      }
+    });
+  }
+
+  /** يوقف كل شي بما فيه الموسيقى (للمحادثة الصوتية) */
+  suspendForVoice() {
+    this._voicePaused = true;
+    this.songs = [];
+    this.current = null;
+    this._suppressRepeat = true;
+    if (this.currentStream) {
+      try {
+        this.currentStream.kill();
+      } catch {
+        /* ignore */
+      }
+      this.currentStream = null;
+    }
+    try {
+      this.player.stop(true);
+    } catch {
+      /* ignore */
+    }
   }
 }
 

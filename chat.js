@@ -320,7 +320,9 @@ async function discoverGroq() {
 // ---------------------------------------------------------------------------
 // المحرّك الموحّد
 // ---------------------------------------------------------------------------
-async function askAI(key, text, userLabel) {
+async function askAI(key, text, userLabel, opts = {}) {
+  const sys = opts.systemPrompt || SYSTEM_PROMPT;
+  const maxTokens = opts.maxOutputTokens || 800;
   await discoverGroq();
 
   const history = historyFor(key);
@@ -331,7 +333,7 @@ async function askAI(key, text, userLabel) {
 
   const geminiBodies = [
     {
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      systemInstruction: { parts: [{ text: sys }] },
       contents: turns.map((t) => ({
         role: t.role === 'model' ? 'model' : 'user',
         parts: [{ text: t.text }],
@@ -339,7 +341,7 @@ async function askAI(key, text, userLabel) {
       generationConfig: {
         temperature: 0.9,
         topP: 0.95,
-        maxOutputTokens: 800,
+        maxOutputTokens: maxTokens,
         thinkingConfig: { thinkingBudget: 0 },
       },
     },
@@ -351,7 +353,7 @@ async function askAI(key, text, userLabel) {
   });
 
   const groqMessages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: sys },
     ...turns.map((t) => ({
       role: t.role === 'model' ? 'assistant' : 'user',
       content: t.text,
@@ -403,6 +405,45 @@ function allExhausted() {
   const g = GEMINI_MODELS.some((m) => !isExhausted(`gemini:${m}`));
   const q = GROQ_KEY ? groqModels.some((m) => !isExhausted(`groq:${m}`)) : false;
   return !g && !q;
+}
+
+// ---------------------------------------------------------------------------
+// رد المحادثة الصوتية (أقصر ومسموع)
+// ---------------------------------------------------------------------------
+const VOICE_PROMPT = `انت «${BOT_NAME}»، بوت يرد بصوته في الروم الصوتي.
+
+- ردّك ينطق بصوت مسموع، فخذه قصيراً جداً: من جملة إلى ثلاث جمل كحد أقصى.
+- ممنوع تنسيق Markdown (لا ** ولا * ولا #) — النطق ما يفهمه.
+- ممنوع إيموجي ورموز وأرقام مكتوبة بصيغة غريبة.
+- جاوب مباشرة وبطبيعة المحادثة، بدون مقدمات ولا اعتذار ولا أسئلة مطولة.
+- لو طلب أغنية: قل "حاضر، أشغّلها لك" فقط.
+- تكلم بالعامية الخليجية المبسطة.`;
+
+const VOICE_REPLY_MAX = Math.max(60, Number(process.env.VOICE_REPLY_MAX || 260));
+
+const VOICE_FALLBACK = 'حاضر، كيف أقدر أساعدك؟';
+
+async function voiceReply({ key, text, userLabel }) {
+  const clean = String(text || '').trim();
+  if (clean) remember(key, 'user', clean);
+  const prompt = clean || 'سلّم عليهم';
+
+  if (!hasAI()) {
+    return { text: clip(VOICE_FALLBACK, VOICE_REPLY_MAX), source: 'local', speak: true };
+  }
+
+  try {
+    const out = await askAI(key, prompt, userLabel, {
+      systemPrompt: VOICE_PROMPT,
+      maxOutputTokens: 200,
+    });
+    const clipped = clip(out, VOICE_REPLY_MAX);
+    remember(key, 'model', clipped);
+    return { text: clipped, source: 'ai', speak: true };
+  } catch (e) {
+    log('⚠️ فشل رد الصوت:', String(e.message).slice(0, 150));
+    return { text: 'ما فهمت زين، كررها مرة ثانية؟', source: 'error', speak: true };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +719,7 @@ function throttled(key) {
 
 module.exports = {
   reply,
+  voiceReply,
   selfTest,
   hasAI,
   buildCommands,

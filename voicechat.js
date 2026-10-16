@@ -27,6 +27,7 @@ class VoiceChat {
     this.conn = conn;
     this.onUtterance = typeof opts.onUtterance === 'function' ? opts.onUtterance : null;
     this.enabled = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
+    this.speaking = false; // البوت يرد حالياً — ما نسمع عشان ما نسجل صوتنا
 
     this._onStart = null;
     this.subs = new Map();
@@ -40,6 +41,11 @@ class VoiceChat {
       lastBytes: 0,
       speakingEvents: 0,
     };
+  }
+
+  /** نمنع الاستقبال مؤقتاً (لما البوت يرد بصوت) */
+  setSpeaking(v) {
+    this.speaking = Boolean(v);
   }
 
   start() {
@@ -78,6 +84,7 @@ class VoiceChat {
 
   _beginSegment(userId) {
     if (!this.enabled) return;
+    if (this.speaking) return; // البوت يتكلم — لا نسجل
     if (this.subs.has(userId)) return; // نتكلم عليه أصلاً
 
     let stream;
@@ -113,10 +120,19 @@ class VoiceChat {
         return;
       }
 
-      log(`🎤 مقطع: ${packets} حزمة | ${bytes} بايت | ${seconds.toFixed(1)} ثانية`);
+      log(
+        `🎤 مقطع: ${packets} حزمة | ${bytes} بايت | ${seconds.toFixed(1)} ثانية` +
+          (bytes / Math.max(0.1, seconds) < 2000 ? ' ⚠️ معدل منخفض' : ''),
+      );
       if (this.onUtterance) {
         try {
-          this.onUtterance({ userId, opus: Buffer.concat(chunks), seconds, packets });
+          this.onUtterance({
+            userId,
+            packets: chunks.slice(),
+            opus: Buffer.concat(chunks),
+            seconds,
+            count: packets,
+          });
         } catch (e) {
           log('⚠️ خطأ في معالجة المقطع:', e.message);
         }

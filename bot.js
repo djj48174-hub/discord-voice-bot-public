@@ -30,6 +30,7 @@ const {
 
 const music = require('./music');
 const chat = require('./chat');
+const speech = require('./speech');
 const { VoiceChat } = require('./voicechat');
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,7 @@ let autoRejoin = true;   // يتوقف لما تكتب /leave
 let joinTimer = null;    // مؤقت إعادة الدخول
 let lastJoinAt = 0;      // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
 let voiceChat = null;    // وحدة المحادثة الصوتية (سماع المتكلمين)
+let voiceBusy = false;   // البوت يرد حالياً — نتجاهل المقاطع الجديدة
 
 // مهلة السماح لمحاولة الاتصال قبل ما نعتبرها فاشلة ونعيدها
 const JOIN_GRACE_MS = 20000;
@@ -254,11 +256,40 @@ function connect(guild, channel) {
     try {
       if (voiceChat) voiceChat.stop();
       voiceChat = new VoiceChat(conn, {
-        onUtterance: (u) => {
-          // المرحلة 1: نتأكد بس إنا نستقبل صوت
-          log(
-            `📥 مقطع صوتي من ${u.userId}: ${u.packets} حزمة / ${u.opus.length} بايت / ${u.seconds.toFixed(1)}ث`,
-          );
+        onUtterance: async (u) => {
+          if (voiceBusy) return;
+          voiceBusy = true;
+          const t0 = Date.now();
+          try {
+            const said = await speech.transcribe(u.packets, { language: 'ar' });
+            if (!said.text || said.text.trim().length < 2) return;
+
+            const wake = (process.env.VOICE_WAKE_WORD || '').trim();
+            const text = wake ? said.text.replace(wake, '').trim() : said.text.trim();
+            if (!text) return;
+
+            log(`🗣️ سمعت (${Date.now() - t0}ms): "${text}"`);
+
+            const name =
+              guild.members?.cache?.get(u.userId)?.displayName ||
+              guild.members?.cache?.get(u.userId)?.user?.username ||
+              'صديقي';
+
+            voiceChat.setSpeaking(true);
+
+            const reply = await chat.voiceReply({ key: `voice:${u.userId}`, text, userLabel: name });
+            log(`💬 رد (${Date.now() - t0}ms): "${reply.text}"`);
+
+            const m = music.getQueue(guild.id);
+            const stream = await speech.speak(reply.text);
+            await m.speak(stream, 1);
+            log(`🔊 نطقنا (${Date.now() - t0}ms)`);
+          } catch (e) {
+            log('⚠️ فشل الرد الصوتي:', String(e.message).slice(0, 150));
+          } finally {
+            voiceChat.setSpeaking(false);
+            voiceBusy = false;
+          }
         },
       });
       voiceChat.start();

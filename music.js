@@ -265,6 +265,52 @@ async function searchSongs(query, limit = 5) {
   return entries.map(mapEntry).filter((s) => s.url);
 }
 
+// ---------------------------------------------------------------------------
+// ساوند كلاود — مصدر بديل لما يوتيوب يرفض الفيديو
+// (كثير مقاطع يوتيوب ترجع "Sign in to confirm you're not a bot" من السيرفرات،
+//  بينما ساوند كلاود يشتغل عادي.)
+// ---------------------------------------------------------------------------
+async function searchSoundCloud(query, limit = 3) {
+  const { out, err, code } = await runYtDlp([
+    `scsearch${limit}:${query}`,
+    '--dump-single-json',
+    '--flat-playlist',
+    '--no-playlist',
+    ...extraYtdlpArgs(),
+  ]);
+
+  if (code !== 0) {
+    const last = err.split('\n').map((s) => s.trim()).filter(Boolean).pop();
+    throw new Error(last || 'فشل البحث في ساوند كلاود');
+  }
+
+  let json;
+  try {
+    json = JSON.parse(out);
+  } catch {
+    throw new Error('ما قدرت أقرأ نتيجة ساوند كلاود');
+  }
+
+  const entries = (json.entries && json.entries.length ? json.entries : [json]).filter(Boolean);
+  return entries
+    .map((e) => ({
+      id: e.id,
+      title: e.title || 'بدون عنوان',
+      url: e.webpage_url || e.url || '',
+      duration: Number(e.duration) || 0,
+      uploader: e.uploader || e.artist || e.channel || '',
+    }))
+    .filter((s) => s.url);
+}
+
+/** يبحث عن نفس الأغنية في ساوند كلاود ويرجّع أول نتيجة */
+async function findOnSoundCloud(song) {
+  const q = [song.title, song.uploader].filter(Boolean).join(' ').trim();
+  if (!q) return null;
+  const results = await searchSoundCloud(q, 3);
+  return results[0] || null;
+}
+
 async function resolveQuery(query, maxPlaylist = 25) {
   const isUrl = /^https?:\/\//i.test(query.trim());
 
@@ -483,6 +529,29 @@ class GuildMusic {
       clientResults.clear();
       activeClient = null;
       return this.play(song);
+    }
+
+    // يوتيوب رفض الفيديو -> نجرّب نفس الأغنية في ساوند كلاود (بدون كوكيز)
+    if (!song.altTried && !/soundcloud\.com/i.test(song.url)) {
+      song.altTried = true;
+      const alt = await findOnSoundCloud(song).catch((e) => {
+        log(`⚠️ بحث ساوند كلاود فشل: ${String(e.message).slice(0, 80)}`);
+        return null;
+      });
+
+      if (alt) {
+        const before = { url: song.url, title: song.title, uploader: song.uploader };
+        song.url = alt.url;
+        song.title = alt.title;
+        if (alt.uploader) song.uploader = alt.uploader;
+
+        log(`🔄 يوتيوب رافضها — أجرّب ساوند كلاود: «${alt.title}»`);
+        if (await this._tryPlay(song, null)) {
+          song.source = 'soundcloud';
+          return true;
+        }
+        Object.assign(song, before); // رجّع بيانات يوتيوب للرسالة
+      }
     }
 
     this.current = null;
@@ -1064,22 +1133,23 @@ async function diagnose(opts = {}) {
   }
 
   // ساوند كلاود: بحث ثم تحميل
-  const scSearch = await probeDownload(['--dump-single-json', '--flat-playlist', `scsearch3:${q}`], 20000);
   let scTitle = null;
   let scUrl = null;
+  let scSearchOk = false;
+  let scSearchWhy = '';
   let scResult = { ok: false, why: 'ما فيه نتيجة' };
 
-  if (scSearch.ok) {
-    try {
-      const j = JSON.parse(scSearch.out || '{}');
-      const e = (j.entries || []).filter(Boolean)[0];
-      if (e) {
-        scTitle = e.title || null;
-        scUrl = e.url || e.webpage_url || null;
-      }
-    } catch (e) {
-      scResult = { ok: false, why: `قراءة النتيجة فشلت: ${e.message}` };
+  try {
+    const results = await searchSoundCloud(q, 3);
+    scSearchOk = results.length > 0;
+    if (results[0]) {
+      scTitle = results[0].title;
+      scUrl = results[0].url;
+    } else {
+      scSearchWhy = 'البحث رجّع صفر نتائج';
     }
+  } catch (e) {
+    scSearchWhy = String(e.message).slice(0, 250);
   }
 
   if (scUrl) {
@@ -1095,8 +1165,8 @@ async function diagnose(opts = {}) {
     youtube,
     soundcloud: {
       searchQuery: q,
-      searchOk: scSearch.ok,
-      searchWhy: scSearch.ok ? '' : scSearch.why,
+      searchOk: scSearchOk,
+      searchWhy: scSearchWhy,
       firstTitle: scTitle,
       firstUrl: scUrl,
       download: scResult,
@@ -1113,6 +1183,7 @@ module.exports = {
   attachPlayerToConnection,
   getOrCreateConnection,
   searchSongs,
+  searchSoundCloud,
   resolveQuery,
   formatDuration,
   diagnostics,

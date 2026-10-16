@@ -307,6 +307,37 @@ class GuildMusic {
     }
   }
 
+  /** يستمع لحالة المشغّل ويرجّع true أول ما يبدأ التشغيل فعلياً */
+  waitForPlaying(timeoutMs = 20000) {
+    if (this.player.state.status === AudioPlayerStatus.Playing) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.player.off('stateChange', onState);
+        resolve(val);
+      };
+      const onState = (_old, next) => {
+        if (next.status === AudioPlayerStatus.Playing) return finish(true);
+        // رجع Idle وما بقي شي بالطابور -> يعني فشل التشغيل
+        if (next.status === AudioPlayerStatus.Idle && !this.current && !this.songs.length) {
+          return finish(false);
+        }
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      this.player.on('stateChange', onState);
+    });
+  }
+
+  /** يشغّل اللي بعدها وينتظر النتيجة: true = اشتغلت، false = فشلت */
+  startAndWait(timeoutMs = 20000) {
+    const wait = this.waitForPlaying(timeoutMs);
+    this.playNext();
+    return wait;
+  }
+
   skip() {
     if (this.currentStream) {
       this.player.stop(true);
@@ -499,24 +530,50 @@ async function handleInteraction(interaction, opts) {
 
     const { music: m } = getOrCreateConnection(guild, channel);
 
+    // هل كان في شي شغّال قبل ما يضيف؟
+    const wasIdle = !m.current;
+
     if (resolved.type === 'playlist') {
       m.songs.push(...resolved.songs);
-      await interaction.editReply(
-        `➕ أضفت **${resolved.songs.length}** أغنية من \`${resolved.name}\` إلى الطابور.`,
-      );
+      if (!wasIdle) {
+        await interaction.editReply(
+          `➕ أضفت **${resolved.songs.length}** أغنية من \`${resolved.name}\` إلى الطابور.`,
+        );
+      }
     } else {
       const song = resolved.songs[0];
       m.songs.push(song);
-      if (m.current) {
+      if (!wasIdle) {
         await interaction.editReply(
           `➕ أضفت **${song.title}** للمركز **#${m.songs.length}** في الطابور.`,
         );
-      } else {
-        await interaction.editReply(`🔎 جاري تشغيل **${song.title}** ...`);
       }
     }
 
-    if (!m.current) m.playNext();
+    if (wasIdle) {
+      // نعرض رسالة مؤقتة، بعدين ننتظر لين يشتغل فعلياً ونأكد
+      await interaction.editReply(
+        resolved.type === 'playlist'
+          ? `🔎 جاري تشغيل **${resolved.songs.length}** أغنية من \`${resolved.name}\` ...`
+          : `🔎 جاري تشغيل **${resolved.songs[0].title}** ...`,
+      );
+
+      const started = await m.startAndWait(25000);
+
+      if (started && m.current) {
+        await interaction.editReply({
+          content: '▶️ **شغّال الآن**',
+          embeds: [nowPlayingEmbed(m)],
+        });
+      } else if (started) {
+        await interaction.editReply(`▶️ **شغّال الآن**: ${resolved.songs[0].title}`);
+      } else {
+        await interaction.editReply(
+          '❌ ما قدرت أشغّل هذي الأغنية.\n' +
+            'غالباً الفيديو ممنوع أو يوتيوب رافض التحميل حالياً — جرّب أغنية ثانية.',
+        );
+      }
+    }
     return true;
   }
 

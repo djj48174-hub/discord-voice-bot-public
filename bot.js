@@ -475,8 +475,8 @@ client.on('messageCreate', async (message) => {
     if (!isDM && !mentioned && !named) return;
 
     const key = isDM
-      ? `dm:${message.channelId}`
-      : `g:${message.guildId}:c:${message.channelId}`;
+      ? `dm:${message.author.id}`
+      : `g:${message.guildId}:c:${message.channelId}:u:${message.author.id}`;
 
     if (chat.throttled(key)) return;
 
@@ -616,8 +616,12 @@ client.on('interactionCreate', async (interaction) => {
             `اسم الروم: **${interaction.guild.channels.cache.get(conn.joinConfig.channelId)?.name ?? 'غير معروف'}**\n` +
             `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
             `الرجوع التلقائي: ${autoRejoin ? 'مفعّل' : 'متوقف'}\n` +
-            `السوالف: ${CHAT_ENABLED ? 'مفعّل' : 'متوقف'} | ` +
-            `ذكاء اصطناعي: ${chat.hasAI() ? `نعم (${chat.model || 'Gemini'})` : 'لا (ردود جاهزة)'}`,
+            `السوالف: ${CHAT_ENABLED ? 'مفعّل' : 'متوقف'}\n` +
+            `ذكاء اصطناعي: ${
+              chat.hasAI()
+                ? `${chat.model || 'متصل'} — موديلات متاحة: ${chat.stats().gemini + chat.stats().groq}`
+                : 'لا (ردود جاهزة)'
+            }`,
         );
       } else {
         await interaction.reply('لست داخل أي روم صوتي 🔴');

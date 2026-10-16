@@ -1,3 +1,6 @@
 .env
 node_modules/
+bin/
 *.log
+bot.log
+test-audio.ogg

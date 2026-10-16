@@ -1,16 +1,21 @@
 {
   "name": "discord-voice-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "بوت ديسكورد يبقى 24/7 داخل روم صوتي",
+  "description": "بوت ديسكورد يقعد 24/7 في الروم الصوتي + يشغّل أغاني",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "postinstall": "node scripts/download-ytdlp.js"
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "^0.7.15"
+  },
+  "allowScripts": {
+    "ffmpeg-static@5.3.0": true
   }
 }

@@ -1,6 +1,7 @@
-# بوت ديسكورد 24/7 داخل الروم الصوتي 🎧
+# بوت ديسكورد 24/7 + مشغّل أغاني 🎧🎵
 
-بوت يدخل روم صوتي معيّن ويقعد فيه **على مدار الساعة**، وإذا انفصل أو طردوه أو نقله أحد يرجع لحاله.
+بوت يدخل روم صوتي معيّن ويقعد فيه **على مدار الساعة** (حتى لو جهازك مطفي)، وإذا انفصل أو طردوه أو نقله أحد يرجع لحاله.
+وتقدر تشغّل أي أغنية بمجرد ما تكتب اسمها أو تلصق رابط يوتيوب.
 
 ---
 
@@ -12,19 +13,54 @@
 | ID البوت | `1523559041262026823` |
 | ID السيرفر | `1506335192355176509` |
 | ID الروم الصوتي | `1533247859095507054` |
+| الاستضافة | Railway (مجاني، بدون بطاقة) |
 
-كل هذي محفوظة في ملف `.env`.
+كل هذي محفوظة في ملف `.env` (محلياً) وفي Variables على Railway.
 
 ---
 
-## ✅ الجزء 1 — التجربة على جهازك (تأكيد إنه يشتغل)
+## 🎮 الأوامر المتاحة داخل ديسكورد
 
-من مجلد المشروع شغّل:
+### الصوت (24/7)
+
+| الأمر | الوظيفة |
+|---|---|
+| `/join` | يدخل الروم ويشغّل الرجوع التلقائي |
+| `/leave` | يطلع ويوقف الرجوع التلقائي (ويوقف الموسيقى) |
+| `/status` | يعرض الحالة الحالية |
+
+### الموسيقى
+
+| الأمر | الوظيفة |
+|---|---|
+| `/play الاسم` | يشغّل أغنية — اكتب اسمها أو الصق رابط يوتيوب/قائمة تشغيل |
+| `/skip` | يتجاوز الأغنية الحالية |
+| `/pause` | يوقف مؤقتاً |
+| `/resume` | يكمّل |
+| `/stop` | يوقف ويفضّي الطابور |
+| `/queue` | يعرض قائمة الانتظار |
+| `/nowplaying` | يعرض الأغنية الحالية |
+| `/volume المستوى` | مستوى الصوت من 0 إلى 100 |
+
+> مثال: اكتب `/play` وبعدها `احمد السويسي` أو الصق رابط يوتيوب — وراح تشتغل مباشرة في الروم الصوتي اللي البوت قاعد فيه.
+
+**ملاحظات:**
+- البوت ما يطلع من الروم لما تخلص الأغاني — يبقى 24/7 زي ما هو.
+- تغيير `/volume` أثناء التشغيل يعيد الأغنية من البداية بالمستوى الجديد (لأن الصوت يُدمج في مصدر الصوت).
+- الصوت يشتغل بمحرّك `yt-dlp` + `ffmpeg` (يأتيان مضمّنين، ما تحتاج تثبّت شي).
+
+---
+
+## 💻 الجزء 1 — التجربة على جهازك
+
+من مجلد المشروع:
 
 ```powershell
 npm install
 npm start
 ```
+
+أول مرة بيسوي `npm install` تنزيل تلقائي لأداتَي `yt-dlp` (في مجلد `bin/`) و `ffmpeg` (عبر `ffmpeg-static`).
 
 المفروض تشوف بالسجل:
 
@@ -32,106 +68,96 @@ npm start
 ✅ دخلت الروم الصوتي: <اسم الروم>
 ```
 
-الحين البوت موجود داخل الروم في ديسكورد. **بس** لو طفّيت جهازك بيطلع — عشان كذا نحتاج الجزء 2.
-
-الأوامر المتاحة داخل ديسكورد:
-
-| الأمر | الوظيفة |
-|---|---|
-| `/join` | يدخل الروم ويشغّل الرجوع التلقائي |
-| `/leave` | يطلع ويوقف الرجوع التلقائي |
-| `/status` | يعرض الحالة الحالية |
+بعدها جرّب `/play` داخل ديسكورد.
 
 ---
 
-## ☁️ الجزء 2 — التشغيل 24/7 على Oracle Cloud (مجاني للأبد)
+## ☁️ الجزء 2 — التشغيل 24/7 على Railway (مجاني، بدون بطاقة)
 
-### الخطوة 1: سجّل في Oracle Cloud
+### المتطلبات
+- حساب GitHub
+- حساب Railway (تسجيل بحساب GitHub مباشرة — **ما يطلب بطاقة**)
 
-1. روح إلى <https://www.oracle.com/cloud/free/>
-2. اضغط **Start for free** وسجّل (يطلب بطاقة للتحقق فقط — **ما يُخصم منها شي** على الخطة المجانية).
-3. اختر **Home Region** قريب منك (أوروبا/الشرق الأوسط أسرع من أمريكا).
-
-### الخطوة 2: أنشئ سيرفر (Instance)
-
-1. من القائمة: **Compute → Instances → Create Instance**
-2. **Name**: `discord-bot`
-3. **Image**: `Ubuntu` → النسخة `22.04` أو `24.04`
-4. **Shape**: اختر
-   - `VM.Standard.A1.Flex` (ARM) — مجاني للأبد، ممتاز. اقترح 1 OCPU / 6 GB.
-   - أو `VM.Standard.E2.1.Micro` (AMD) — أضعف بس يكفي للبوت.
-   > لو طلع خطأ "Out of capacity" للـ ARM، جرّب **Availability Domain** ثاني، أو استخدم E2.1.Micro.
-5. **Add SSH keys** → اختر **Generate a key pair for me** → نزّل **Private key** (ملف `.key`) و **Public key**.
-6. اضغط **Create**.
-
-### الخطوة 3: اتصل بالسيرفر من ويندوز
-
-افتح PowerShell في مجلد المفتاح:
+### الطريقة 1: من داخل المشروع (اللي استخدمناه) ✅
 
 ```powershell
-ssh -i .\ssh-key-2026-01-01.key ubuntu@<PUBLIC_IP>
+# ثبّت الـ CLI مرة وحدة
+npm i -g @railway/cli
+
+# سجّل دخول
+railway login
+
+# اربط المشروع
+railway link
+
+# ارفع الكود (يبني Dockerfile تلقائياً)
+railway up
 ```
 
-(IP تلاقيه في صفحة الـ Instance تحت **Public IP address**)
+### الإعدادات (Variables) المطلوبة
 
-> لو طلع خطأ عن صلاحيات المفتاح:
-> ```powershell
-> icacls .\ssh-key-2026-01-01.key /inheritance:r
-> icacls .\ssh-key-2026-01-01.key /grant:r "$($env:USERNAME):R"
-> ```
+من Railway → خدمتك → تبويب **Variables**:
 
-### الخطوة 4: ارفع ملفات المشروع
+| المتغير | القيمة |
+|---|---|
+| `DISCORD_TOKEN` | توكن البوت (سري) |
+| `GUILD_ID` | `1506335192355176509` |
+| `VOICE_CHANNEL_ID` | `1533247859095507054` |
+| `CHECK_SECONDS` | `30` |
+| `LOCK_TO_CHANNEL` | `true` |
 
-من PowerShell **بجهازك** (مو داخل السيرفر)، وأنت واقف في مجلد المشروع:
+أو من الـ CLI:
 
 ```powershell
-# أنشئ المجلد على السيرفر
-ssh -i .\ssh-key.key ubuntu@<PUBLIC_IP> "mkdir -p ~/discord-voice-bot"
-
-# ارفع الملفات (بدون node_modules)
-scp -i .\ssh-key.key bot.js package.json .env setup_server.sh discord-voice-bot.service ubuntu@<PUBLIC_IP>:~/discord-voice-bot/
+railway variables set DISCORD_TOKEN=ضع_التوكن_هنا
+railway variables set GUILD_ID=1506335192355176509
+railway variables set VOICE_CHANNEL_ID=1533247859095507054
+railway variables set CHECK_SECONDS=30
+railway variables set LOCK_TO_CHANNEL=true
 ```
 
-### الخطوة 5: شغّل سكربت التجهيز
+### متابعة السجل
 
-داخل السيرفر (بعد `ssh`) نفّذ:
-
-```bash
-cd ~/discord-voice-bot
-bash setup_server.sh
+```powershell
+railway logs
 ```
 
-السكربت يسوي كل شي: يثبّت Node، يثبّت المكتبات، ويسجّل البوت كخدمة تشتغل تلقائياً وترجع تشتغل لو طاح أو السيرفر أعاد التشغيل.
+### فحص الحالة عبر الـ HTTP
 
-### الخطوة 6: تأكد إنه شغّال
+البوت فيه سيرفر صحة صغير:
 
-```bash
-sudo systemctl status discord-voice-bot
-tail -f ~/discord-voice-bot/bot.log
+```
+https://<رابط-مشروعك>.up.railway.app/health
 ```
 
-المفروض تشوف `✅ دخلت الروم الصوتي`.
+يرجّع شي زي:
 
-**خلص!** من الحين، حتى لو طفّيت جهازك، البوت يبقى داخل الروم 24/7. 🎉
+```json
+{"status":"ok","bot":"Bot 24/7#4774","voice":"connected","uptime":123}
+```
+
+> **مهم:** Railway المجاني ينام التطبيق لو ما وصله طلب HTTP لمدة معينة. عشان يبقى صاحي 24/7 لازم إما:
+> - تضيف Domain عام (Settings → Networking → Generate Domain)، بعدين تستخدم خدمة مجانية مثل [UptimeRobot](https://uptimerobot.com) أو [cron-job.org](https://cron-job.org) تزور `/health` كل 5 دقائق.
+> - أو تضع الخدمة على خطة مدفوعة.
+>
+> البوت نفسه فيه Watchdog داخلي يرجع يدخل الروم، بس ما يقدر يمنع Railway من إيقاف الحاوية وهو نايم.
 
 ---
 
-## 🛠️ أوامر إدارة الخدمة (على السيرفر)
+## 🛠️ أوامر Railway المفيدة
 
 | الأمر | الوظيفة |
 |---|---|
-| `sudo systemctl status discord-voice-bot` | حالة البوت |
-| `tail -f ~/discord-voice-bot/bot.log` | متابعة السجل مباشرة |
-| `sudo systemctl restart discord-voice-bot` | إعادة تشغيل |
-| `sudo systemctl stop discord-voice-bot` | إيقاف مؤقت |
-| `sudo systemctl start discord-voice-bot` | تشغيل |
+| `railway logs` | متابعة السجل مباشرة |
+| `railway up` | نشر نسخة جديدة |
+| `railway variables --kv` | عرض المتغيرات |
+| `railway variables set KEY=VAL` | تعديل/إضافة متغير |
+| `railway status` | حالة المشروع |
 
 ### تحديث الكود لاحقاً
 
-```bash
-cd ~/discord-voice-bot
-# ارفع bot.js الجديد من جهازك، بعدين:
-sudo systemctl restart discord-voice-bot
+```powershell
+railway up
 ```
 
 ---
@@ -139,15 +165,16 @@ sudo systemctl restart discord-voice-bot
 ## ⚠️ ملاحظات مهمة
 
 1. **الأمان**: ملف `.env` يحتوي توكن البوت. لا ترفعه على GitHub ولا تشاركه.
-   لو انكشف، سوّي **Reset Token** من <https://discord.com/developers/applications> → Bot → Reset Token، وحدّث ملف `.env`.
+   لو انكشف، سوّي **Reset Token** من <https://discord.com/developers/applications> → Bot → Reset Token، وحدّث القيمة في Railway (`railway variables set DISCORD_TOKEN=...`) وفي `.env` المحلي.
+   > بعد أي Reset، أي نسخة قديمة شغّالة تبقى تعمل مؤقتاً، لكن أول ما تعيد التشغيل تموت. لازم تحدّث التوكن.
 
-2. **صلاحيات البوت في السيرفر**: لازم يكون عنده صلاحية **Connect** على الروم الصوتي و **View Channel**.
+2. **صلاحيات البوت في السيرفر**: لازم يكون عنده **Connect** و **Speak** على الروم الصوتي و **View Channel**.
 
 3. **حد الأماكن**: لو الروم فيه `user_limit` (حد أقصى للأعضاء) والبوت ما قدر يدخل — ارفع الحد أو ألغِه.
 
-4. **الروم ما ينفصل**: البوت ما يعتمد على الصوت نفسه، بس يبقى متصلاً. لو سيرفرك فيه **AFK Timeout**، البوت يرجع للروم المحدد تلقائياً لأنه مضبوط `LOCK_TO_CHANNEL=true`.
+4. **الرجوع التلقائي**: مع `LOCK_TO_CHANNEL=true` البوت يرجع للروم المحدد تلقائياً لو نقله أحد أو انفصل.
 
-5. **التكلفة**: خطة Oracle **Always Free** ما تُحسب عليها فلوس طالما تستخدم الأشكال المجانية (مكتوب جنبها "Always Free"). لكن Oracle تقدر تحذف السيرفر إذا كان **خامل فترة طويلة جدًا** — البوت شغّال 24/7 فما فيه خمول.
+5. **الصوت في الاستضافة**: YouTube أحياناً يطلب تحقق من السيرفرات. لو طلع خطأ تحميل، حدّد متغير `YTDLP_EXTRA_ARGS` أو `YTDLP_COOKIES` (اختياري).
 
 ---
 
@@ -155,9 +182,13 @@ sudo systemctl restart discord-voice-bot
 
 | الملف | الوصف |
 |---|---|
-| `bot.js` | كود البوت |
+| `bot.js` | كود البوت الرئيسي (الاتصال + الرجوع التلقائي + أوامر الصوت) |
+| `music.js` | نظام الموسيقى (بحث/تشغيل/طابور) |
+| `scripts/download-ytdlp.js` | ينزّل أداة `yt-dlp` تلقائياً بعد `npm install` |
 | `package.json` | المكتبات المطلوبة |
+| `Dockerfile` | بيئة النشر على Railway |
+| `.dockerignore` | ملفات مستثناة من صورة Docker |
 | `.env` | الإعدادات والتوكن (سري) |
 | `.env.example` | نموذج للإعدادات |
-| `setup_server.sh` | سكربت تجهيز السيرفر تلقائياً |
+| `setup_server.sh` | سكربت تجهيز سيرفر Linux (بديل، غير مستخدم حالياً) |
 | `discord-voice-bot.service` | ملف خدمة systemd (بديل يدوي) |

@@ -1,32 +1,29 @@
-# Dockerfile للبوت — يعمل على Render/Railway/Fly.io/Koyeb
-FROM node:20-alpine
+# Dockerfile — يعمل على Railway / Render / Fly.io / Koyeb
+FROM node:20-slim
 
-# تثبيت التبعيات الصوتية (libopus, python, build tools)
-RUN apk add --no-cache \
-    opus \
+# أدوات البناء + الشهادات (ffmpeg يجي من ffmpeg-static)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     python3 \
     make \
     g++ \
-    ffmpeg
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# نسخ ملفات التبعيات أولاً للاستفادة من كاش Docker
+# ننسخ ملفات التبعيات أولاً للاستفادة من كاش Docker
 COPY package*.json ./
+COPY scripts ./scripts
 
-# تثبيت مكتبات الإنتاج فقط
-RUN npm ci --omit=dev --no-audit --no-fund
+# تثبيت المكتبات (يشمل تنزيل yt-dlp و ffmpeg-static)
+ENV NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=false
+RUN npm install --omit=dev --no-audit --no-fund
 
 # نسخ الكود
-COPY bot.js .env.example ./
+COPY bot.js music.js .env.example ./
 
-# نستخدم .env من متغيرات البيئة في المنصة (ما ننسخ .env المحلي للصورة)
-# لو تبي تنسخه للصورة محلياً، ألغِ التعليق عن السطر تحت:
-# COPY .env .
-
-# منفذ وهمي (بعض المنصات تطلب PORT) — البوت ما يفتح HTTP بس عشان الصحة
+# منفذ الصحة (Railway يضبط PORT تلقائياً)
 ENV PORT=3000
 EXPOSE 3000
 
-# تشغيل البوت
 CMD ["node", "bot.js"]

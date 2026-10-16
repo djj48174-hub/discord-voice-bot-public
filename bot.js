@@ -28,6 +28,8 @@ const {
   entersState,
 } = require('@discordjs/voice');
 
+const music = require('./music');
+
 // ---------------------------------------------------------------------------
 // الإعدادات
 // ---------------------------------------------------------------------------
@@ -166,6 +168,12 @@ function connect(guild, channel) {
 
   conn.on(VoiceConnectionStatus.Ready, () => {
     log(`✅ دخلت الروم الصوتي: ${channel.name}`);
+    // نربط مشغّل الموسيقى بالاتصال عشان يشتغل الصوت
+    try {
+      music.attachPlayerToConnection(guild.id, conn);
+    } catch (e) {
+      log('تنبيه: ما قدرت أربط مشغّل الموسيقى:', e.message);
+    }
   });
 
   conn.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -240,7 +248,8 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('join').setDescription('يدخل الروم الصوتي ويقعد فيه'),
     new SlashCommandBuilder().setName('leave').setDescription('يطلع من الروم ويوقف الرجوع التلقائي'),
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
-  ].map((c) => c.toJSON());
+    ...music.buildCommands(),
+  ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
 
   try {
     if (GUILD_ID) {
@@ -261,6 +270,12 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
+    // أوامر الموسيقى أولاً (play/skip/pause/resume/stop/queue/nowplaying/volume)
+    const handled = await music.handleInteraction(interaction, {
+      defaultChannelId: VOICE_CHANNEL_ID,
+    });
+    if (handled) return;
+
     if (interaction.commandName === 'join') {
       autoRejoin = true;
       await interaction.deferReply();
@@ -283,6 +298,14 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'leave') {
       autoRejoin = false;
+      // نوقف الموسيقى أيضاً
+      if (interaction.guild && music.hasQueue(interaction.guild.id)) {
+        try {
+          music.getQueue(interaction.guild.id).stopAll();
+        } catch {
+          /* ignore */
+        }
+      }
       const conn = interaction.guild ? getVoiceConnection(interaction.guild.id) : null;
       if (conn) {
         conn.destroy();

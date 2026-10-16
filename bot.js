@@ -132,6 +132,7 @@ const healthServer = http.createServer(async (req, res) => {
           speaking: voice?.speaking ?? null,
           streamSuspended: voice?.streaming ?? null,
           voiceChannelMembers: (g.channels.cache.get(conn.joinConfig.channelId)?.members?.size ?? 0),
+          audioBytes: ogg.length,
         };
       }
 
@@ -322,6 +323,24 @@ function connect(guild, channel) {
             const stream = await speech.speak(reply.text);
             await m.speak(stream, 1);
             log(`🔊 نطقنا (${Date.now() - t0}ms)`);
+
+            // ننشر المحادثة في الشات النصي كمان عشان تكون ظاهرة
+            try {
+              const target =
+                guild.channels.cache.find(
+                  (c) =>
+                    c.isTextBased?.() &&
+                    c.isViewable?.() &&
+                    c.permissionsFor(guild.members.me)?.has('SendMessages'),
+                ) || guild.systemChannel;
+              if (target) {
+                await target.send(
+                  `🎤 **${name}:** ${text}\n🤖 **${BOT_NAME}:** ${reply.text}`,
+                );
+              }
+            } catch (e) {
+              log('⚠️ ما قدرت أنشر رد الصوت في الشات:', e.message.slice(0, 80));
+            }
           } catch (e) {
             log('⚠️ فشل الرد الصوتي:', String(e.message).slice(0, 150));
           } finally {

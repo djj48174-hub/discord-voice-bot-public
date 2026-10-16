@@ -794,7 +794,8 @@ class GuildMusic {
     } catch {
       /* ignore */
     }
-    this.playNext();
+    // نشغّل بدون انتظار — ما نبي نعلّق رد الصوت على يوتيوب المحجوب
+    this.playNext().catch(() => {});
   }
 
   /**

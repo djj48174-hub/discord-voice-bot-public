@@ -132,16 +132,27 @@ async function speak(text, opts = {}) {
   const clean = String(text || '').trim();
   if (!clean) throw new Error('ما فيه نص للنطق');
 
-  const tts = new MsEdgeTTS();
-  await tts.setMetadata(opts.voice || nextVoice(), OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-  const { audioStream } = await tts.toStream(clean, { rate: opts.rate || TTS_RATE });
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const tts = new MsEdgeTTS();
+      // نبدّل الصوت كل محاولة — التقييد (429) يكون على الصوت الحالي
+      await tts.setMetadata(opts.voice || nextVoice(), OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+      const { audioStream } = await tts.toStream(clean, { rate: opts.rate || TTS_RATE });
 
-  const webm = await streamToBuffer(audioStream);
-  if (webm.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
+      const webm = await streamToBuffer(audioStream);
+      if (webm.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
 
-  const ogg = await webmToOgg(webm);
-  log(`🔊 صوت جاهز: ${ogg.length} بايت`);
-  return ogg;
+      const ogg = await webmToOgg(webm);
+      log(`🔊 صوت جاهز: ${ogg.length} بايت`);
+      return ogg;
+    } catch (e) {
+      lastErr = e;
+      log(`⚠️ محاولة النطق ${attempt + 1} فشلت: ${String(e.message).slice(0, 90)}`);
+      await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+    }
+  }
+  throw lastErr || new Error('فشل توليد الصوت');
 }
 
 // ---------------------------------------------------------------------------

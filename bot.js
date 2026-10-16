@@ -97,6 +97,44 @@ const healthServer = http.createServer(async (req, res) => {
     log('[diag] طلب فحص المصادر…');
     try {
       const u = new URL(req.url, 'http://localhost');
+
+      // تشغيل صوت تجريبي في الروم الصوتي (لتشخيص مشكلة عدم سماع الرد)
+      if (u.searchParams.get('play') === '1') {
+        const g = (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();
+        if (!g) return { error: 'ما فيه سيرفر' };
+
+        const conn = getVoiceConnection(g.id);
+        if (!conn) return { error: 'البوت مو في روم صوتي' };
+
+        const m = music.getQueue(g.id);
+        const states = [];
+        const onState = (o, n) => states.push(`${o.status} -> ${n.status}`);
+        m.player.on('stateChange', onState);
+
+        const ogg = await speech.speak('هلا، هذا اختبار صوت من البوت. هل تسمعني؟');
+        const ok = await m.speak(ogg, 1);
+
+        setTimeout(() => m.player.off('stateChange', onState), 2000);
+
+        const me = g.members?.me;
+        const voice = me?.voice;
+        return {
+          played: ok,
+          states,
+          playerStatus: m.player.state.status,
+          channelId: conn.joinConfig.channelId,
+          channelName: g.channels.cache.get(conn.joinConfig.channelId)?.name || null,
+          selfMute: conn.joinConfig.selfMute,
+          selfDeaf: conn.joinConfig.selfDeaf,
+          serverMute: voice?.mute ?? null,
+          serverDeaf: voice?.deaf ?? null,
+          suppress: voice?.suppress ?? null,
+          speaking: voice?.speaking ?? null,
+          streamSuspended: voice?.streaming ?? null,
+          voiceChannelMembers: (g.channels.cache.get(conn.joinConfig.channelId)?.members?.size ?? 0),
+        };
+      }
+
       const data = await music.diagnose({
         query: u.searchParams.get('q') || '',
         vids: u.searchParams.get('vids') || '',

@@ -245,9 +245,25 @@ function probeClient(client, testUrl) {
 }
 
 /**
+ * هل يوتيوب صالح للاستخدام من هذا السيرفر؟
+ * (يوتيوب يحجب IP سيرفرات كثيرة — نعتمد على فحص العملاء عند التشغيل)
+ */
+function ytUsableNow() {
+  if (/^youtube$/i.test((process.env.PREFER_SOURCE || '').trim())) return true;
+  if (String(process.env.YTDLP_FORCE_YOUTUBE || '').toLowerCase() === 'true') return true;
+  return Boolean(activeClient) && clientResults.get(activeClient) === true;
+}
+
+/**
  * يفحص العملاء بالترتيب ويختار أول واحد يشتغل.
  */
 async function ensureWorkingClient(force = false) {
+  // على سيرفرات المعالج فيها ضعيف، فحص ١٠ عملاء يأكل المعالج بلا فايدة لو يوتيوب محجوب
+  if (String(process.env.YTDLP_SKIP_PROBE || '').toLowerCase() === 'true') {
+    log('⏭️ تخطّيت فحص عملاء يوتيوب (YTDLP_SKIP_PROBE=true) — نعتمد ساوند كلاود');
+    activeClient = null;
+    return null;
+  }
   if (!force && activeClient && clientResults.get(activeClient) === true) return activeClient;
 
   const testUrl = process.env.YTDLP_PROBE_URL || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
@@ -348,7 +364,105 @@ async function searchSongs(query, limit = 5) {
 // (كثير مقاطع يوتيوب ترجع "Sign in to confirm you're not a bot" من السيرفرات،
 //  بينما ساوند كلاود يشتغل عادي.)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// بحث ساوند كلاود السريع: من واجهة ساوند كلاود نفسها (JSON) بدل yt-dlp
+// السبب: yt-dlp يأكل المعالج (خصوصاً على السيرفرات المجانية الضعيفة)
+// ولو فشل أي شي نرجع تلقائياً لطريقة yt-dlp
+// ---------------------------------------------------------------------------
+let scClientId = null;
+let scClientIdAt = 0;
+
+const UA_BROWSER =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36';
+
+/** نجيب client_id من صفحة ساوند كلاود (نخزّنه لعدة ساعات) */
+async function scGetClientId(force = false) {
+  if (!force && scClientId && Date.now() - scClientIdAt < 6 * 3600 * 1000) return scClientId;
+
+  const r = await fetch('https://soundcloud.com/', {
+    headers: { 'User-Agent': UA_BROWSER },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const html = await r.text();
+
+  const scripts = [
+    ...new Set(
+      [...html.matchAll(/src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)].map((m) => m[1]),
+    ),
+  ].slice(0, 14);
+
+  for (const url of scripts) {
+    try {
+      const js = await (
+        await fetch(url, { headers: { 'User-Agent': UA_BROWSER }, signal: AbortSignal.timeout(20000) })
+      ).text();
+      const m = /client_id\s*[:=]\s*["']([A-Za-z0-9]{20,})["']/.exec(js);
+      if (m) {
+        scClientId = m[1];
+        scClientIdAt = Date.now();
+        return scClientId;
+      }
+    } catch {
+      /* نجرّب اللي بعده */
+    }
+  }
+  return null;
+}
+
+/** بحث مباشر من واجهة ساوند كلاود — سريع جداً (بلا معالج) */
+async function searchSoundCloudApi(query, limit = 10) {
+  const cid = await scGetClientId();
+  if (!cid) throw new Error('ما لقيت client_id');
+
+  const url =
+    'https://api-v2.soundcloud.com/search/tracks?q=' +
+    encodeURIComponent(query) +
+    '&client_id=' +
+    cid +
+    '&limit=' +
+    Math.max(3, Math.min(50, limit)) +
+    '&app_locale=en';
+
+  const r = await fetch(url, {
+    headers: { 'User-Agent': UA_BROWSER },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) scClientId = null; // مفتاح قديم — نجدده المرة الجاية
+    throw new Error('HTTP ' + r.status);
+  }
+
+  const j = await r.json();
+  const tracks = Array.isArray(j.collection) ? j.collection : [];
+  return tracks
+    .map((t) => ({
+      id: String(t.id || ''),
+      title: t.title || t.user?.username || 'بدون عنوان',
+      url: t.permalink_url || '',
+      duration: Math.round((Number(t.duration) || 0) / 1000),
+      uploader: t.user?.username || '',
+      artwork: t.artwork_url || null,
+      source: 'soundcloud',
+    }))
+    .filter((s) => s.url && /^\d+$/.test(s.id));
+}
+
 async function searchSoundCloud(query, limit = 3) {
+  // 1) الطريقة السريعة (واجهة ساوند كلاود)
+  try {
+    const t0 = Date.now();
+    const fast = await searchSoundCloudApi(query, limit);
+    if (fast.length) {
+      log(`⚡ بحث ساوند كلاود السريع: ${fast.length} نتيجة في ${Date.now() - t0}ms`);
+      return fast;
+    }
+    log('↩️ البحث السريع رجّع صفر — نجرّب yt-dlp');
+  } catch (e) {
+    log(`↩️ البحث السريع فشل (${String(e.message).slice(0, 60)}) — نجرّب yt-dlp`);
+  }
+
+  // 2) الطريقة القديمة (yt-dlp)
   const { out, err, code } = await runYtDlp([
     `scsearch${limit}:${query}`,
     '--dump-single-json',
@@ -558,10 +672,7 @@ async function resolveQuery(query, maxPlaylist = 25) {
   let bestRanked = [];
 
   const preferYouTube = /^youtube$/i.test((process.env.PREFER_SOURCE || '').trim());
-  // هل يوتيوب شغّال من هذا السيرفر؟ (فحص العملاء يصير عند التشغيل)
-  // على سيرفرات كثيرة يوتيوب يحجب IP السيرفر — نتخطاه بسرعة بدل ما نضيّع دقيقة على الفاضي
-  const forceYt = String(process.env.YTDLP_FORCE_YOUTUBE || '').toLowerCase() === 'true';
-  const ytUsable = preferYouTube || forceYt || (Boolean(activeClient) && clientResults.get(activeClient) === true);
+  const ytUsable = ytUsableNow();
   if (!ytUsable) {
     log('⏭️ يوتيوب مو متاح من هنا — نعتمد ساوند كلاود');
   }
@@ -808,8 +919,8 @@ class GuildMusic {
       this.current = song;
       if (await this._tryPlay(song, null)) return true;
 
-      // فشل ساوند كلاود؟ نجرب نفس الاسم في يوتيوب كحل أخير
-      if (!song.altTried) {
+      // فشل ساوند كلاود؟ نجرب نفس الاسم في يوتيوب كحل أخير (لو يوتيوب متاح)
+      if (!song.altTried && ytUsableNow()) {
         song.altTried = true;
         try {
           const results = await searchSongs(song.title, 1);
@@ -826,6 +937,14 @@ class GuildMusic {
         }
       }
 
+      this.current = null;
+      this.currentStream = null;
+      return false;
+    }
+
+    // يوتيوب مو متاح من هذا السيرفر -> لا نضيّع وقت في تجربة العملاء
+    if (!ytUsableNow()) {
+      log('⏭️ يوتيوب مو متاح — تخطّيت محاولة تشغيله');
       this.current = null;
       this.currentStream = null;
       return false;

@@ -194,8 +194,8 @@ const healthServer = http.createServer(async (req, res) => {
         const me = g.members?.me;
         const voice = me?.voice;
         const ch = g.channels.cache.get(conn.joinConfig.channelId);
-        const cd = conn.state?.connectionData;
-        const dave = conn.state?.dave;
+        const cd = music.connConnectionData(conn);
+        const dave = music.connDave(conn);
         send({
           ...result,
           states,
@@ -388,13 +388,8 @@ function connect(guild, channel) {
   lastJoinAt = Date.now();
   let conn;
   try {
-    conn = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: guild.id,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
+    // مصدر واحد للاتصال — نفس الإعدادات (selfMute/selfDeaf/تصحيح الصوت)
+    conn = music.getOrCreateConnection(guild, channel).conn;
   } catch (err) {
     log('فشل الاتصال الصوتي:', err.message);
     scheduleJoin(5000);

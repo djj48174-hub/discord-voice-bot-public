@@ -34,13 +34,31 @@ function log(...args) {
   console.log(`[${new Date().toISOString()}]`, '[music]', ...args);
 }
 
+/** بيانات الاتصال الفعلية (packetsPlayed/sequence/ssrc/التشفير) — مصدرها كائن الشبكة */
+function connConnectionData(connection) {
+  try {
+    return (
+      connection?.state?.networking?.state?.connectionData ||
+      connection?.state?.connectionData ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** جلسة DAVE (التشفير من الطرف للطرف) */
+function connDave(connection) {
+  try {
+    return connection?.state?.networking?.state?.dave || null;
+  } catch {
+    return null;
+  }
+}
+
 /** كم حزمة صوت أرسلناها فعلاً لديسكورد على هذا الاتصال (تشخيص) */
 function countPlayedPackets(connection) {
-  try {
-    return Number(connection?.state?.connectionData?.packetsPlayed || 0);
-  } catch {
-    return 0;
-  }
+  return Number(connConnectionData(connection)?.packetsPlayed || 0);
 }
 
 /** إعدادات تصحيح الصوت (VOICE_DEBUG=true يطبع رسائل WS/UDP/DAVE) */
@@ -1428,4 +1446,6 @@ module.exports = {
   createAudioStream,
   getVoiceDebug,
   countPlayedPackets,
+  connConnectionData,
+  connDave,
 };

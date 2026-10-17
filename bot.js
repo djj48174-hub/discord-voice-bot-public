@@ -312,6 +312,10 @@ const healthServer = http.createServer(async (req, res) => {
       const data = await music.diagnose({
         query: u.searchParams.get('q') || '',
         vids: u.searchParams.get('vids') || '',
+        client: u.searchParams.get('client') || '',
+        seq: u.searchParams.get('seq') || '',
+        timeout: u.searchParams.get('timeout') || '',
+        jsr: u.searchParams.get('jsr') || '',
       });
       log('[diag] تم الفحص');
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });

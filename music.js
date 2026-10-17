@@ -148,6 +148,9 @@ function extraYtdlpArgs() {
   if (process.env.YTDLP_EXTRA_ARGS) {
     args.push(...process.env.YTDLP_EXTRA_ARGS.split(' ').filter(Boolean));
   }
+  // لو السيرفر بطيء/يوتيوب يطلب تحدي JS: نحدد محرّك JS يدوياً (node موجود بأي صورة Node)
+  const jsrt = (process.env.YTDLP_JS_RUNTIME || '').trim();
+  if (jsrt) args.push('--js-runtimes', jsrt);
   return args;
 }
 
@@ -1592,12 +1595,43 @@ async function diagnose(opts = {}) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const youtube = await Promise.all(
-    clients.map(async (c) => {
-      const r = await probeDownload([...clientArgs(c), ytUrl], 15000);
-      return { client: c, ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why };
-    }),
-  );
+  const youtube = [];
+  // وضع "عميل واحد بتسلسل" — يقيس الزمن الحقيقي بلا تزاحم عمليات (مهم على المعالج الضعيف)
+  const only = String(opts.client || '').trim();
+  const seq = String(opts.seq || '') === '1' || Boolean(only);
+  const tmoRaw = Number(opts.timeout || 0);
+  const tmo = Number.isFinite(tmoRaw) && tmoRaw >= 3000 ? Math.min(tmoRaw, 120000) : 15000;
+  const jsr = String(opts.jsr || '').trim();
+  const jsrArgs = jsr ? ['--js-runtimes', jsr] : [];
+  const list = only ? [only] : clients;
+  if (seq) {
+    for (const c of list) {
+      const t0 = Date.now();
+      const r = await probeDownload([...jsrArgs, ...clientArgs(c), ytUrl], tmo);
+      youtube.push({
+        client: c,
+        ok: r.ok,
+        bytes: r.bytes,
+        seconds: Number(((Date.now() - t0) / 1000).toFixed(1)),
+        why: r.ok ? '' : r.why,
+      });
+    }
+  } else {
+    const results = await Promise.all(
+      list.map(async (c) => {
+        const t0 = Date.now();
+        const r = await probeDownload([...jsrArgs, ...clientArgs(c), ytUrl], tmo);
+        return {
+          client: c,
+          ok: r.ok,
+          bytes: r.bytes,
+          seconds: Number(((Date.now() - t0) / 1000).toFixed(1)),
+          why: r.ok ? '' : r.why,
+        };
+      }),
+    );
+    youtube.push(...results);
+  }
 
   // نفس الأغاني اللي فشلت عند المستخدم (بالعميل الافتراضي)
   const userVideos = [];
@@ -1606,29 +1640,33 @@ async function diagnose(opts = {}) {
     userVideos.push({ vid: v, ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why });
   }
 
-  // ساوند كلاود: بحث ثم تحميل
+  // ساوند كلاود: بحث ثم تحميل (نتخطاه لو نفحص عميل يوتيوب واحد — أسرع)
   let scTitle = null;
   let scUrl = null;
   let scSearchOk = false;
   let scSearchWhy = '';
   let scResult = { ok: false, why: 'ما فيه نتيجة' };
 
-  try {
-    const results = await searchSoundCloud(q, 3);
-    scSearchOk = results.length > 0;
-    if (results[0]) {
-      scTitle = results[0].title;
-      scUrl = results[0].url;
-    } else {
-      scSearchWhy = 'البحث رجّع صفر نتائج';
+  if (!only) {
+    try {
+      const results = await searchSoundCloud(q, 3);
+      scSearchOk = results.length > 0;
+      if (results[0]) {
+        scTitle = results[0].title;
+        scUrl = results[0].url;
+      } else {
+        scSearchWhy = 'البحث رجّع صفر نتائج';
+      }
+    } catch (e) {
+      scSearchWhy = String(e.message).slice(0, 250);
     }
-  } catch (e) {
-    scSearchWhy = String(e.message).slice(0, 250);
-  }
 
-  if (scUrl) {
-    const r = await probeDownload([scUrl], 20000);
-    scResult = { ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why };
+    if (scUrl) {
+      const r = await probeDownload([scUrl], 20000);
+      scResult = { ok: r.ok, bytes: r.bytes, why: r.ok ? '' : r.why };
+    }
+  } else {
+    scSearchWhy = 'تخطيناه (فحص عميل واحد)';
   }
 
   return {

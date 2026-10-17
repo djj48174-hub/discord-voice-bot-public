@@ -15,8 +15,8 @@ function log(...args) {
   console.log(`[${new Date().toISOString()}]`, '[voicechat]', ...args);
 }
 
-// كم ننتظر صمت قبل ما نعتبر المقطع انتهى
-const SILENCE_MS = Math.max(300, Number(process.env.VOICE_SILENCE_MS || 800));
+// كم ننتظر صمت قبل ما نعتبر المقطع انتهى (أعلى = ما نقطع كلامك بالنص)
+const SILENCE_MS = Math.max(300, Number(process.env.VOICE_SILENCE_MS || 1100));
 // أقصى طول للمقطع الواحد (نقطعه لو المستخدم طول)
 const MAX_UTTERANCE_MS = Math.max(2000, Number(process.env.VOICE_MAX_MS || 15000));
 // أقل طول مقطع نعتبره كلام (نمنع النقرات والضجيج)
@@ -26,6 +26,7 @@ class VoiceChat {
   constructor(conn, opts = {}) {
     this.conn = conn;
     this.onUtterance = typeof opts.onUtterance === 'function' ? opts.onUtterance : null;
+    // ملاحظة: حتى لو الرد الصوتي متوقف، نظل نسمع عشان نلتقط أمر "شغّل الرد الصوتي"
     this.enabled = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
     this.speaking = false; // البوت يرد حالياً — ما نسمع عشان ما نسجل صوتنا
 
@@ -40,12 +41,20 @@ class VoiceChat {
       lastAt: null,
       lastBytes: 0,
       speakingEvents: 0,
+      enabled: this.enabled,
     };
   }
 
   /** نمنع الاستقبال مؤقتاً (لما البوت يرد بصوت) */
   setSpeaking(v) {
     this.speaking = Boolean(v);
+  }
+
+  /** تشغيل/إيقاف الرد الصوتي (نظل نسمع عشان أمر التشغيل) */
+  setEnabled(v) {
+    this.enabled = Boolean(v);
+    this.stats.enabled = this.enabled;
+    return this.enabled;
   }
 
   start() {
@@ -83,7 +92,6 @@ class VoiceChat {
   }
 
   _beginSegment(userId) {
-    if (!this.enabled) return;
     if (this.speaking) return; // البوت يتكلم — لا نسجل
     if (this.subs.has(userId)) return; // نتكلم عليه أصلاً
 
@@ -132,6 +140,7 @@ class VoiceChat {
             opus: Buffer.concat(chunks),
             seconds,
             count: packets,
+            enabled: this.enabled,
           });
         } catch (e) {
           log('⚠️ خطأ في معالجة المقطع:', e.message);

@@ -55,6 +55,8 @@ let joinTimer = null;    // مؤقت إعادة الدخول
 let lastJoinAt = 0;      // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
 let voiceChat = null;    // وحدة المحادثة الصوتية (سماع المتكلمين)
 let voiceBusy = false;   // البوت يرد حالياً — نتجاهل المقاطع الجديدة
+// الرد الصوتي شغّال ولا متوقف (ينشغّل/ينوقف بأمر بالكلام أو بالكتابة أو بـ /voice)
+let voiceChatOn = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
 
 // مهلة السماح لمحاولة الاتصال قبل ما نعتبرها فاشلة ونعيدها
 const JOIN_GRACE_MS = 20000;
@@ -479,6 +481,62 @@ function connect(guild, channel) {
               guild.members?.cache?.get(u.userId)?.user?.username ||
               'صديقي';
 
+            // 1) هل هو أمر صوتي (شغّل / وقف الرد الصوتي)؟
+            const intent = voiceToggleIntent(text);
+            if (intent) {
+              const wasOn = voiceChatOn;
+              setVoiceChat(intent === 'on', `بالكلام من ${name}`);
+              voiceChat.setSpeaking(true);
+              try {
+                if (wasOn !== voiceChatOn || intent === 'on') {
+                  await speakLine(
+                    guild,
+                    intent === 'on'
+                      ? 'تم، شغلت الرد الصوتي. تفضل تكلم وأنا معك.'
+                      : 'تم، وقفت الرد الصوتي. لو تبي أرجعه قل: شغل الرد الصوتي.',
+                  );
+                }
+              } catch (e) {
+                log('⚠️ ما قدرت أأكد الأمر بالصوت:', String(e.message).slice(0, 120));
+              } finally {
+                voiceChat.setSpeaking(false);
+              }
+              return;
+            }
+
+            // 2) الرد الصوتي متوقف؟ نتجاهل الكلام (بس نظل نسمع عشان أمر التشغيل)
+            if (!voiceChatOn) {
+              log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
+              return;
+            }
+
+            // 3) أوامر الروم بالصوت (شغّل أغنية / اطلع / وقف / التالي / الصوت)
+            let vcmd = null;
+            try {
+              vcmd = await runVoiceCommand(guild, text);
+            } catch (e) {
+              log('⚠️ خطأ في الأمر الصوتي:', String(e.message).slice(0, 140));
+            }
+            if (vcmd) {
+              log(`🎛️ أمر صوتي: "${text}"`);
+              voiceChat.setSpeaking(true);
+              try {
+                if (vcmd.say) await speakLine(guild, forSpeech(vcmd.say));
+              } catch (e) {
+                log('⚠️ ما قدرت أنطق التأكيد:', String(e.message).slice(0, 120));
+              } finally {
+                voiceChat.setSpeaking(false);
+              }
+              if (typeof vcmd.after === 'function') {
+                try {
+                  await vcmd.after();
+                } catch (e) {
+                  log('⚠️ تنفيذ الأمر الصوتي:', String(e.message).slice(0, 140));
+                }
+              }
+              return;
+            }
+
             voiceChat.setSpeaking(true);
 
             const reply = await chat.voiceReply({ key: `voice:${u.userId}`, text, userLabel: name });
@@ -504,6 +562,7 @@ function connect(guild, channel) {
           }
         },
       });
+      voiceChat.setEnabled(voiceChatOn);
       voiceChat.start();
     } catch (e) {
       log('تنبيه: تعذّر تشغيل المحادثة الصوتية:', e.message);
@@ -628,7 +687,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     const botChannelId = newState.guild?.members?.me?.voice?.channelId ?? null;
     const onlyBot =
       newState.channel && [...newState.channel.members.values()].every((mm) => mm.user?.bot);
-    if (GREET_ON_JOIN && humanJoined && botChannelId === newState.channelId && onlyBot) {
+    if (GREET_ON_JOIN && voiceChatOn && humanJoined && botChannelId === newState.channelId && onlyBot) {
       setTimeout(() => {
         greetTest(newState.guild, newState.member?.displayName || 'يا هلا').catch((e) =>
           log('⚠️ فشل الترحيب الصوتي:', String(e.message).slice(0, 140)),
@@ -797,6 +856,332 @@ async function ensureBotRole(guild) {
 }
 
 // ---------------------------------------------------------------------------
+// أوامر الرد الصوتي (تشغيل/إيقاف) — تنفهم بالكلام أو بالكتابة أو بأمر /voice
+// ---------------------------------------------------------------------------
+/** تنظيف عربي: نشيل التشكيل ونوحّد الحروف عشان نقارن بثقة */
+function normAr(s) {
+  return String(s || '')
+    .replace(/[\u064B-\u0652\u0670\u0640]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+// عبارات إيقاف الرد الصوتي
+const VOICE_OFF_PHRASES = [
+  'وقف الرد الصوتي',
+  'اوقف الرد الصوتي',
+  'اطفي الرد الصوتي',
+  'طفي الرد الصوتي',
+  'اقفل الرد الصوتي',
+  'قفل الرد الصوتي',
+  'وقف المحادثه الصوتيه',
+  'اوقف المحادثه الصوتيه',
+  'اقفل المحادثه الصوتيه',
+  'قفل المحادثه الصوتيه',
+  'اوقف المحادثه',
+  'وقف المحادثه',
+  'وقف الرد',
+  'اوقف الرد',
+  'وقف الصوت',
+  'اقفل الصوت',
+  'لا ترد علي',
+  'خلك ساكت',
+];
+
+// عبارات تشغيل الرد الصوتي
+const VOICE_ON_PHRASES = [
+  'شغل الرد الصوتي',
+  'فعل الرد الصوتي',
+  'افتح الرد الصوتي',
+  'رجع الرد الصوتي',
+  'شغل المحادثه الصوتيه',
+  'فعل المحادثه الصوتيه',
+  'افتح المحادثه الصوتيه',
+  'شغل الصوت',
+  'كلمني',
+  'تكلم معي',
+];
+
+/**
+ * يفحص إذا النص أمر تشغيل/إيقاف للرد الصوتي.
+ * @returns {'on'|'off'|null}
+ */
+function voiceToggleIntent(raw) {
+  const t = normAr(raw);
+  if (!t || t.length > 45) return null;
+  // نفحص الإيقاف أول (لأن "لا ترد علي" تحتوي "رد علي")
+  if (VOICE_OFF_PHRASES.some((p) => t.includes(p))) return 'off';
+  if (VOICE_ON_PHRASES.some((p) => t.includes(p))) return 'on';
+  return null;
+}
+
+/** يشغّل/يوقف الرد الصوتي فعلياً */
+function setVoiceChat(on, by = '') {
+  voiceChatOn = Boolean(on);
+  if (voiceChat) {
+    try {
+      voiceChat.setEnabled(voiceChatOn);
+    } catch {
+      /* ignore */
+    }
+  }
+  log(`🎚️ الرد الصوتي: ${voiceChatOn ? 'شغّال ✅' : 'متوقف ⛔'}${by ? ` — ${by}` : ''}`);
+  return voiceChatOn;
+}
+
+/** ينطق جملة قصيرة (تأكيد أمر صوتي) */
+async function speakLine(guild, line) {
+  const m = music.getQueue(guild.id);
+  const ogg = await speech.speak(line);
+  return m.speak(ogg, 1);
+}
+
+// ---------------------------------------------------------------------------
+// تنفيذ الأوامر بالصوت: شغّل أغنية / اطلع / وقف / التالي / ارفع الصوت ...
+// ---------------------------------------------------------------------------
+/** يشيل التنسيق والرموز عشان النطق يكون نظيف */
+function forSpeech(s) {
+  return String(s || '')
+    .replace(/[*_`#~|]/g, '')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '')
+    // نحافظ على الحروف والتشكيل العربي (التشكيل من نوع Mark مو Letter)
+    .replace(/[^\p{L}\p{N}\p{M}\s،.؟!]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// أوامر الروم
+const V_LEAVE_RE =
+  /^(?:اطلع|اطلع من الروم|اطلع برا|اطلع من هنا|اطلع برى|اخرج|اخرج من الروم|طلعني|طلعني من الروم|اقفل الروم|قفل الروم|انزل من الروم|لا تقعد في الروم)$/;
+const V_JOIN_RE = /^(?:ادخل|ادخل الروم|دخل الروم|ارجع|ارجع للروم|رجعني|تعال الروم|تعال للروم)$/;
+const V_NOW_RE =
+  /^(?:(?:وش|ايش)\s+(?:تشغل|شغال|الاغنيه|الاغاني|الطابور)(?:\s+الحين)?|وش اللي شغال|وش هذي الاغنيه|وش اللي تشغله)$/;
+// إيقاف الموسيقى (واضح)
+const V_STOP_RE =
+  /^(?:وقف|اوقف|وقفها|ايقاف|اوقفها|وقف الموسيقي|وقف الاغنيه|وقف الاغاني|طفي الموسيقي|اطفي الموسيقي|اقفل الموسيقي|قفل الموسيقي|سكر الموسيقي|سكرها)$/;
+// كلمات قصيرة تعني "سكّت الصوت" — نقبلها فقط إذا فيه موسيقى شغالة
+const V_STOP_WEAK_RE = /^(?:بس|خلاص|اسكت|سكت|تكفي)$/;
+const V_SKIP_RE =
+  /^(?:تخطي|تخطى|سكب|التالي|التاليه|اللي بعدها|غير الاغنيه|غير الموسيقي|بدلها|روح للي بعدها|skip|next)$/;
+const V_PAUSE_RE = /^(?:وقفها شوي|وقف الموسيقي شوي|اسكت شوي|بريح|بريك|pause)$/;
+const V_RESUME_RE = /^(?:كمل|كملها|اكمل|واصل|شغلها مره ثانيه|شغل الموسيقي|resume|continue)$/;
+const V_LOOP_RE = /^(?:كرر|كررها|اعد|اعيد|كرر الاغنيه|loop)$/;
+const V_LOOP_OFF_RE = /^(?:الغي التكرار|وقف التكرار|لا تكرر|loop off)$/;
+const V_VOL_UP_RE = /^(?:ارفع الصوت|علي الصوت|زود الصوت|ارفع شوي|صوتك واطي|ارفع صوتك|ارفع صوت)$/;
+const V_VOL_DOWN_RE = /^(?:نزل الصوت|وطي الصوت|خفض الصوت|قلل الصوت|نزل شوي|وطي شوي|نزل صوتك)$/;
+const V_GENERIC_SONG_RE = /^(?:لي|اغنيه|موسيقي|شي|شيء|اي شي|اغاني|شي زين)$/;
+// طلب تشغيل أغنية بالصوت (يسمح بكلمة تمهيدية مثل "طيب" أو "يا")
+const V_PLAY_RE =
+  /^(?:(?:طيب|يا|هلا|يالله|يلا|لو سمحت|ممكن|الحين|هي|والله)\s+)*(?:شغّل لي|شغل لي|شغللي|شغّل|شغل|سمّعني|سمعني|ابغى اسمع|أبغى اسمع|ابي اسمع|أبي اسمع|play me|play)\s*[:،\-]?\s*(.+)$/i;
+
+/** روم البوت الصوتي الحالي */
+function botVoiceChannel(guild) {
+  const byId = VOICE_CHANNEL_ID ? guild.channels.cache.get(VOICE_CHANNEL_ID) : null;
+  return byId || guild.members?.me?.voice?.channel || null;
+}
+
+/** يشغّل أغنية طلبها المستخدم بالصوت */
+async function playByVoice(guild, query) {
+  const channel = botVoiceChannel(guild);
+  if (!channel) return { say: 'ما لقيت الروم الصوتي.' };
+
+  let m;
+  try {
+    ({ music: m } = music.getOrCreateConnection(guild, channel));
+  } catch (e) {
+    log('⚠️ ما دخلت الروم للأغنية:', String(e.message).slice(0, 120));
+    return { say: 'ما قدرت أدخل الروم الصوتي.' };
+  }
+
+  const wasIdle = !m.current;
+
+  // نبدأ البحث، ونطق تأكيد سريع بالتوازي عشان ما يحس المستخدم بصمت طويل
+  const search = music.resolveQuery(query).catch((e) => {
+    log(`⚠️ ما لقيت "${query}": ${String(e.message).slice(0, 120)}`);
+    return null;
+  });
+  await speakLine(guild, 'طيب، أشوفها لك الحين.').catch(() => {});
+  const resolved = await search;
+
+  if (!resolved || !Array.isArray(resolved.songs) || !resolved.songs.length) {
+    return { say: `ما لقيت ${query}. جرب تقول اسمها أوضح.` };
+  }
+
+  m.songs.push(...resolved.songs);
+  const title = forSpeech(resolved.songs[0].title);
+
+  if (!wasIdle) {
+    return { say: `ضفتها للطابور. الحين شغالة ${forSpeech(m.current?.title || '')}.` };
+  }
+
+  return {
+    say: `طيب، شغالة الآن ${title}.`,
+    after: async () => {
+      try {
+        const ok = await m.startAndWait(60000);
+        if (!ok) log('⚠️ الموسيقى ما بدأت (بالأمر الصوتي)');
+      } catch (e) {
+        log('⚠️ تشغيل الموسيقى بالأمر الصوتي:', String(e.message).slice(0, 140));
+      }
+    },
+  };
+}
+
+/**
+ * ينفّذ أوامر الروم الصوتي (موسيقى/خروج/دخول/صوت).
+ * @returns {Promise<{say?: string|null, after?: Function|null}|null>}
+ */
+async function runVoiceCommand(guild, rawText) {
+  const n = normAr(rawText);
+  if (!n) return null;
+
+  const m0 = music.hasQueue(guild.id) ? music.getQueue(guild.id) : null;
+  const playing = Boolean(m0 && m0.current);
+  const vol = m0 ? m0.volume : 0.5;
+
+  // ---- اطلع من الروم ----
+  if (V_LEAVE_RE.test(n)) {
+    const chName = forSpeech(botVoiceChannel(guild)?.name || 'الروم');
+    autoRejoin = false;
+    try {
+      m0?.stopAll();
+    } catch {
+      /* ignore */
+    }
+    return {
+      say: `طيب، اطلع من ${chName}. لو تبي أرجع قول: ادخل الروم.`,
+      after: async () => {
+        await new Promise((r) => setTimeout(r, 1500));
+        try {
+          getVoiceConnection(guild.id)?.destroy();
+        } catch {
+          /* ignore */
+        }
+      },
+    };
+  }
+
+  // ---- ارجع للروم ----
+  if (V_JOIN_RE.test(n)) {
+    autoRejoin = true;
+    const conn = getVoiceConnection(guild.id);
+    if (conn && conn.state.status === VoiceConnectionStatus.Ready) {
+      return { say: 'أنا معك في الروم، تفضل.' };
+    }
+    const ch = botVoiceChannel(guild);
+    if (!ch) return { say: 'ما لقيت الروم الصوتي.' };
+    return { say: 'طيب، رجعت للروم.', after: async () => connect(guild, ch) };
+  }
+
+  // ---- وش شغال الآن ----
+  if (V_NOW_RE.test(n)) {
+    return {
+      say: playing ? `الحين شغالة ${forSpeech(m0.current.title)}.` : 'ما فيه شي شغال الحين.',
+    };
+  }
+
+  // ---- وقف الموسيقى ----
+  if (V_STOP_RE.test(n) || (playing && V_STOP_WEAK_RE.test(n))) {
+    if (!playing) return { say: 'ما فيه شي شغال الحين.' };
+    try {
+      m0.stopAll();
+    } catch {
+      /* ignore */
+    }
+    return { say: 'طيب، وقفت الموسيقى.' };
+  }
+
+  // ---- التالية ----
+  if (V_SKIP_RE.test(n)) {
+    if (!playing) return { say: 'ما فيه شي شغال الحين.' };
+    try {
+      m0.skip();
+    } catch {
+      /* ignore */
+    }
+    return { say: 'طيب، جبت اللي بعدها.' };
+  }
+
+  // ---- إيقاف مؤقت / متابعة ----
+  if (V_PAUSE_RE.test(n)) {
+    if (!playing) return { say: 'ما فيه شي شغال الحين.' };
+    try {
+      m0.player.pause();
+    } catch {
+      /* ignore */
+    }
+    return { say: 'طيب، وقفتها مؤقتاً. قول كمل عشان أكملها.' };
+  }
+  if (V_RESUME_RE.test(n)) {
+    if (!playing) return { say: 'ما فيه شي شغال الحين.' };
+    try {
+      m0.player.unpause();
+    } catch {
+      /* ignore */
+    }
+    return { say: 'طيب، كملت.' };
+  }
+
+  // ---- تكرار ----
+  if (V_LOOP_OFF_RE.test(n)) {
+    try {
+      m0?.toggleLoop(false);
+    } catch {
+      /* ignore */
+    }
+    return { say: 'طيب، وقفت التكرار.' };
+  }
+  if (V_LOOP_RE.test(n)) {
+    try {
+      m0?.toggleLoop(true);
+    } catch {
+      /* ignore */
+    }
+    return { say: 'طيب، بكرر الأغنية.' };
+  }
+
+  // ---- الصوت ----
+  if (V_VOL_UP_RE.test(n)) {
+    const v = Math.min(1, Math.round((vol + 0.2) * 10) / 10);
+    try {
+      m0?.setVolume(v);
+    } catch {
+      /* ignore */
+    }
+    return { say: `طيب، رفعت الصوت إلى ${Math.round(v * 100)} بالمية.` };
+  }
+  if (V_VOL_DOWN_RE.test(n)) {
+    const v = Math.max(0, Math.round((vol - 0.2) * 10) / 10);
+    try {
+      m0?.setVolume(v);
+    } catch {
+      /* ignore */
+    }
+    return { say: `طيب، نزلت الصوت إلى ${Math.round(v * 100)} بالمية.` };
+  }
+
+  // ---- شغّل أغنية ----
+  const playN = n.match(V_PLAY_RE);
+  if (playN) {
+    // نستخرج الاسم من النص الأصلي عشان نحفظ الإملاء
+    const rawMatch = String(rawText || '').match(V_PLAY_RE);
+    let query = String((rawMatch && rawMatch[1]) || playN[1] || '').trim();
+    query = query.replace(/^لي\s+/, '').trim();
+    if (!query || V_GENERIC_SONG_RE.test(normAr(query))) {
+      return { say: 'وش الأغنية اللي تبي أشغلها؟' };
+    }
+    return playByVoice(guild, query);
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // المحادثة (شات) 💬
 // ---------------------------------------------------------------------------
 /** هل الرسالة تنادي البوت باسمه؟ */
@@ -844,6 +1229,22 @@ client.on('messageCreate', async (message) => {
 
     await message.channel.sendTyping?.().catch(() => {});
 
+    // أمر تشغيل/إيقاف الرد الصوتي (بالكتابة)
+    const vIntent = voiceToggleIntent(text);
+    if (vIntent) {
+      const on = setVoiceChat(vIntent === 'on', `بالكتابة من ${message.author.tag}`);
+      await message.reply({
+        content: on
+          ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'
+          : '⛔ وقفت الرد الصوتي.\n' +
+              'ترجعه بإحدى الطرق:\n' +
+              '• `/voice` → **تشغيل**\n' +
+              '• أو قل في الروم بالصوت: **«شغّل الرد الصوتي»**',
+        allowedMentions: { repliedUser: false },
+      });
+      return;
+    }
+
     // أولاً: هل هو أمر موسيقى؟ ("شغل لي ...") — ننفّذه فعلياً
     const musicResult = await runMusicFromChat(message, text);
     if (musicResult) {
@@ -871,6 +1272,16 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('join').setDescription('يدخل الروم الصوتي ويقعد فيه'),
     new SlashCommandBuilder().setName('leave').setDescription('يطلع من الروم ويوقف الرجوع التلقائي'),
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
+    new SlashCommandBuilder()
+      .setName('voice')
+      .setDescription('يشغّل أو يوقف الرد الصوتي في الروم 🎙️')
+      .addStringOption((o) =>
+        o
+          .setName('الحالة')
+          .setDescription('تشغيل أو إيقاف')
+          .setRequired(true)
+          .addChoices({ name: 'تشغيل', value: 'on' }, { name: 'إيقاف', value: 'off' }),
+      ),
     ...music.buildCommands(),
     ...chat.buildCommands(),
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
@@ -957,6 +1368,20 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'voice') {
+      const v = interaction.options.getString('الحالة');
+      const on = setVoiceChat(v === 'on', `أمر /voice من ${interaction.user.username}`);
+      await interaction.reply(
+        on
+          ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'
+          : '⛔ وقفت الرد الصوتي.\n' +
+              'ترجعه بإحدى الطرق:\n' +
+              '• `/voice` → **تشغيل**\n' +
+              '• أو قل في الروم بالصوت: **«شغّل الرد الصوتي»**',
+      );
+      return;
+    }
+
     if (interaction.commandName === 'status') {
       const conn = interaction.guild ? getVoiceConnection(interaction.guild.id) : null;
       if (conn && conn.state.status === VoiceConnectionStatus.Ready) {
@@ -965,6 +1390,7 @@ client.on('interactionCreate', async (interaction) => {
             `اسم الروم: **${interaction.guild.channels.cache.get(conn.joinConfig.channelId)?.name ?? 'غير معروف'}**\n` +
             `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
             `الرجوع التلقائي: ${autoRejoin ? 'مفعّل' : 'متوقف'}\n` +
+            `الرد الصوتي: ${voiceChatOn ? 'مفعّل ✅' : 'متوقف ⛔'}\n` +
             `السوالف: ${CHAT_ENABLED ? 'مفعّل' : 'متوقف'}\n` +
             `ذكاء اصطناعي: ${
               chat.hasAI()
@@ -1031,13 +1457,18 @@ process.on('uncaughtException', (err) => log('uncaughtException:', err?.message 
 // ---------------------------------------------------------------------------
 // التشغيل
 // ---------------------------------------------------------------------------
-if (!TOKEN) {
-  log('❌ ما لقيت DISCORD_TOKEN في ملف .env');
-  process.exit(1);
-}
+if (require.main === module) {
+  if (!TOKEN) {
+    log('❌ ما لقيت DISCORD_TOKEN في ملف .env');
+    process.exit(1);
+  }
 
-log('جاري تسجيل الدخول...');
-client.login(TOKEN).catch((err) => {
-  log('❌ فشل تسجيل الدخول:', err.message);
-  process.exit(1);
-});
+  log('جاري تسجيل الدخول...');
+  client.login(TOKEN).catch((err) => {
+    log('❌ فشل تسجيل الدخول:', err.message);
+    process.exit(1);
+  });
+} else {
+  // يسمح باختبار الأوامر الصوتية بدون تشغيل البوت (test-voicecmd.js)
+  module.exports = { normAr, voiceToggleIntent, forSpeech, runVoiceCommand };
+}

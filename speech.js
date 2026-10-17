@@ -347,6 +347,9 @@ function oggToWav(ogg) {
         'ogg',
         '-i',
         'pipe:0',
+        // ننظّف الصوت ونعدّل مستواه عشان Whisper يفهم أحسن (المايك الواطي = فهم غلط)
+        '-af',
+        'highpass=f=70,dynaudnorm=f=200:g=12:p=0.9',
         '-ar',
         '16000',
         '-ac',

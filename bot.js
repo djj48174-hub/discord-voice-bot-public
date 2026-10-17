@@ -104,6 +104,21 @@ const healthServer = http.createServer(async (req, res) => {
     try {
       const u = new URL(req.url, 'http://localhost');
 
+      // قياس سرعة/دقة التفريغ لكل موديل على مقاطع حقيقية (stt=1)
+      if (u.searchParams.get('stt') === '1') {
+        const modelsParam = (u.searchParams.get('models') || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const caps = Number(u.searchParams.get('caps') || 2);
+        const rows = await speech.benchStt({
+          models: modelsParam.length ? modelsParam : undefined,
+          caps,
+          perModelMs: Number(u.searchParams.get('timeout') || 12000),
+        });
+        log(`[diag] قياس التفريغ: ${rows.length} نتيجة`);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, rows }, null, 2));
+        return;
+      }
+
       // فحص سريع للاتصال الصوتي بدون تشغيل صوت (info=1)
       if (u.searchParams.get('info') === '1') {
         const g = (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();

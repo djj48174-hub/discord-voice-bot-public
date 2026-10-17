@@ -716,24 +716,45 @@ async function callGeminiStt(model, b64, withThinking, timeoutMs) {
   });
 }
 
+/** يفكّ رد Gemini إلى نص التفريغ */
+function parseGeminiTranscript(raw) {
+  try {
+    const j = JSON.parse(raw);
+    return { text: String(j?.transcript || '').trim(), unclear: Boolean(j?.unclear), bad: false };
+  } catch {
+    const cleaned = String(raw || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+    const bad = !cleaned || /^[{[]/.test(cleaned) || /"(transcript|unclear)"\s*:/.test(cleaned);
+    return { text: cleaned, unclear: false, bad };
+  }
+}
+
 /** يفرّغ wav (16kHz mono) عبر Gemini — أدق للهجات من Whisper */
-async function transcribeGemini(wav) {
+async function transcribeGemini(wav, opts = {}) {
   if (!GEMINI_KEY) throw new Error('ما فيه مفتاح Gemini للتفريغ');
   const models = GEMINI_STT_MODELS.filter(sttModelReady);
   if (!models.length) throw new Error('كل موديلات Gemini للتفريغ في فترة توقف');
 
   const b64 = wav.toString('base64');
-  const timeoutMs = Number(process.env.STT_TIMEOUT_MS || 25000);
+  // مهم للسرعة: الموديل اللي يبطي نحرمه بسرعة ونروح للي بعده
+  const perModelMs = Number(process.env.STT_MODEL_TIMEOUT_MS || opts.perModelMs || 6000);
+  const budgetMs = Number(process.env.STT_BUDGET_MS || opts.budgetMs || 12000);
+  const start = Date.now();
   let lastErr = null;
 
   for (const model of models) {
+    const left = budgetMs - (Date.now() - start);
+    if (left < 800) {
+      log(`⏳ خلص وقت التفريغ (${budgetMs}ms) — ما أكمل باقي الموديلات`);
+      break;
+    }
     try {
       const t0 = Date.now();
+      const timeoutMs = Math.min(perModelMs, left);
       let res = await callGeminiStt(model, b64, true, timeoutMs);
       // الموديلات lite ترفض إعداد التفكير (400 invalid argument) → نعيد بدونه
       if (res.status === 400) {
         await res.text().catch(() => '');
-        res = await callGeminiStt(model, b64, false, timeoutMs);
+        res = await callGeminiStt(model, b64, false, Math.min(perModelMs, budgetMs - (Date.now() - start)));
       }
 
       if (!res.ok) {
@@ -751,32 +772,13 @@ async function transcribeGemini(wav) {
         .join('')
         .trim();
 
-      let text = '';
-      let unclear = false;
-      let parsed = false;
-      try {
-        const j = JSON.parse(raw);
-        if (j && typeof j === 'object') {
-          text = String(j.transcript || '').trim();
-          unclear = Boolean(j.unclear);
-          parsed = true;
-        }
-      } catch {
-        /* مو JSON */
-      }
+      const parsed = parseGeminiTranscript(raw);
+      let { text, unclear } = parsed;
 
       // رد مقطوع/غير صالح (يصير مع الموديلات التجريبية) → نجرّب الموديل التالي
-      if (!parsed) {
-        const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-        if (!cleaned) {
-          coolSttModel(model, 60 * 1000);
-          throw new Error('رد Gemini فاضي');
-        }
-        if (/^[{[]/.test(cleaned) || /"(transcript|unclear)"\s*:/.test(cleaned)) {
-          coolSttModel(model, 2 * 60 * 1000);
-          throw new Error(`رد Gemini مو JSON صالح: ${cleaned.slice(0, 60)}`);
-        }
-        text = cleaned;
+      if (parsed.bad) {
+        coolSttModel(model, 2 * 60 * 1000);
+        throw new Error(`رد Gemini مو JSON صالح: ${String(raw).slice(0, 60)}`);
       }
 
       // تعليقات وصفية بدل تفريغ (يصير لو المقطع همس/غير مفهوم)
@@ -793,7 +795,7 @@ async function transcribeGemini(wav) {
       if (unclear || !text || isJunkTranscript(text)) {
         return { text: '', junk: true, source: 'gemini', unclear };
       }
-      return { text, source: 'gemini' };
+      return { text, source: 'gemini', model };
     } catch (e) {
       lastErr = e;
       const msg = String(e.message || e);
@@ -802,11 +804,50 @@ async function transcribeGemini(wav) {
       const hinted = parseRetryDelay(e.body || msg);
       const wait = coolSttModel(model, hinted);
       log(
-        `⚠️ فشل تفريغ Gemini (${model}، ${status || '-'}) — أوقفه ${Math.round(wait / 1000)} ثانية: ${msg.slice(0, 200)}`,
+        `⚠️ فشل تفريغ Gemini (${model}، ${status || '-'}، ${Date.now() - start}ms) — أوقفه ${Math.round(wait / 1000)} ثانية: ${msg.slice(0, 160)}`,
       );
     }
   }
   throw lastErr || new Error('فشل تفريغ Gemini');
+}
+
+/** قياس أداء التفريغ لكل موديل على مقاطع حقيقية محفوظة (للتشخيص من داخل السيرفر) */
+async function benchStt({ models = GEMINI_STT_MODELS, caps = 2, perModelMs = 12000 } = {}) {
+  const list = captures.filter((c) => c.wav).slice(-Math.max(1, Math.min(5, caps)));
+  const out = [];
+  for (const model of models) {
+    for (let i = 0; i < list.length; i++) {
+      const c = list[i];
+      const b64 = c.wav.toString('base64');
+      const t0 = Date.now();
+      const row = { model, cap: i + 1, seconds: Number(c.seconds?.toFixed?.(1) || 0) };
+      try {
+        let res = await callGeminiStt(model, b64, true, perModelMs);
+        let body = await res.text();
+        if (res.status === 400) {
+          row.thinking400 = true;
+          const t1 = Date.now();
+          res = await callGeminiStt(model, b64, false, perModelMs);
+          body = await res.text();
+          row.msNoThink = Date.now() - t1;
+        }
+        row.ms = Date.now() - t0;
+        row.status = res.status;
+        if (res.ok) {
+          const p = parseGeminiTranscript(body);
+          row.text = p.text.slice(0, 60);
+          row.unclear = p.unclear;
+        } else {
+          row.error = body.replace(/\s+/g, ' ').slice(0, 110);
+        }
+      } catch (e) {
+        row.ms = Date.now() - t0;
+        row.error = String(e.message || e).replace(/\s+/g, ' ').slice(0, 110);
+      }
+      out.push(row);
+    }
+  }
+  return out;
 }
 
 /** تفريغ Whisper (احتياطي) مع فحص الثقة */
@@ -1058,6 +1099,7 @@ module.exports = {
   // للفحص المباشر
   transcribeGemini,
   transcribeWhisper,
+  benchStt,
   GEMINI_STT_MODELS,
   warmTtsCache,
   TTS_VOICE,

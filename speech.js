@@ -521,51 +521,171 @@ function captureDebug(withAudio = false) {
   }));
 }
 
-/**
- * يفرّغ حزم Opus خام إلى نص.
- * @param {Buffer[]} opusPackets حزم Opus من ديسكورد
- * @param {object} opts { language, prompt }
- */
-async function transcribe(opusPackets, opts = {}) {
-  if (!GROQ_KEY) throw new Error('ما فيه مفتاح Groq');
-  const list = (Array.isArray(opusPackets) ? opusPackets : []).filter((p) => p && p.length > 0);
-  if (!list.length) throw new Error('ما فيه صوت');
+// ---------------------------------------------------------------------------
+// تفريغ Gemini — أدق بكثير للهجة الخليجية من Whisper (مجرّب على تسجيلات حقيقية)
+//   Whisper سمع: "طلّا جوع بروح أكله"  |  Gemini سمع: "والله جوعان بروح آكل" ✅
+// ---------------------------------------------------------------------------
+const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_STT_MODELS = (
+  process.env.GEMINI_STT_MODELS ||
+  // ترتيب مجرّب على تسجيلات المستخدم الحقيقية:
+  //   gemini-3.5-flash  = أدق واحد (سمع "والله جوعان بروح آكل" صح) ≈ 1.5-2.5s مع إلغاء التفكير
+  //   gemini-flash-latest = قريب منه لكن أبطأ
+  //   الموديلات lite أسرع لكنها هلّوست على صوته (تجي احتياط أخير)
+  'gemini-3.5-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-flash-lite-latest'
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const geminiSttCool = new Map(); // model -> until
 
-  const ogg = muxOggOpus(list, { channels: 2, sampleRate: 48000 });
-  const { wav, level } = await oggToWav(ogg);
-  const seconds = (list.length * 20) / 1000; // كل حزمة Opus ≈ 20ms
+const STT_PROMPT_GEMINI = `أنت مفرّغ صوتي دقيق لمحادثة صوتية بالعامية الخليجية (سعودية).
+اكتب الكلام المنطوق حرفياً كما هو، مع علامات ترقيم بسيطة.
+قواعد صارمة:
+- اكتب النص فقط. ممنوع تجاوب على الكلام أو تعلّق عليه أو تشرح.
+- ممنوع الترجمة. خلّ الكلمات الأجنبية (أسماء أغاني، أرقام إنجليزية) بالإنجليزي مثل ما انلفظت.
+- ممنوع تأليف أو إكمال من عندك. لو ما سمعت شي واضح خلّ transcript فاضية و unclear=true.
+- لو الكلام همس أو غير مفهوم أو صمت: unclear=true و transcript="".`;
 
-  // نحفظ المقطع للتشخيص (نسمع صوت المتحدث الحقيقي عند الحاجة)
-  const rec = rememberCapture({
-    at: Date.now(),
-    seconds,
-    level,
-    wav: wav.length < 400000 ? wav : null,
-    packets: list.length,
-    rate: Math.round(
-      list.reduce((a, p) => a + p.length, 0) / Math.max(1, list.length),
-    ),
-  });
-  const done = (o) => {
-    if (rec) Object.assign(rec, o);
-    return o;
+const GEMINI_STT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    transcript: { type: 'STRING' },
+    unclear: { type: 'BOOLEAN' },
+  },
+  required: ['transcript', 'unclear'],
+};
+
+const STT_THINKING = process.env.STT_THINKING; // فاضي = 0 (أسرع)، 'off' = لا نرسل الإعداد
+
+function geminiSttConfig(withThinking) {
+  const cfg = {
+    temperature: 0,
+    maxOutputTokens: 400,
+    responseMimeType: 'application/json',
+    responseSchema: GEMINI_STT_SCHEMA,
   };
-  log(
-    `🎚️ مقطع (${seconds.toFixed(1)} ثانية | ${rec ? rec.rate : '?'} بايت/حزمة) مستوى: أعلى ${level.max}dB / متوسط ${level.mean}dB`,
-  );
-
-  // فلتر مهم: الصمت والضجيج = هلوسة. نتجاهل المقطع قبل ما نرسله أصلاً
-  // ملاحظة: dynaudnorm يرفع الصوت الواطي بعد هذي القياسة، فنقبل الأوطأ هنا
-  //         (وفحص ثقة Whisper no_speech_prob هو خط الدفاع الثاني).
-  const softDb = Number(process.env.STT_MIN_DB || -45);
-  const hardDb = Number(process.env.STT_HARD_DB || -55);
-  const maxDb = level.max;
-  if (maxDb != null && (maxDb <= hardDb || (maxDb <= softDb && seconds > 6))) {
-    log(
-      `🔇 صوت واطي/صمت (أعلى مستوى ${maxDb}dB، ${seconds.toFixed(1)} ثانية) — تجاهلته قبل التفريغ`,
-    );
-    return done({ text: '', quiet: true, level });
+  const want = STT_THINKING === undefined || STT_THINKING === '' ? '0' : String(STT_THINKING);
+  if (withThinking && want !== 'off' && want !== 'default') {
+    // موديلات Gemini 3 تفكّر افتراضياً وهذا يضاعف زمن التفريغ — نلغيه
+    const n = Number(want);
+    cfg.thinkingConfig = { thinkingBudget: Number.isFinite(n) ? n : 0 };
   }
+  return cfg;
+}
+
+async function callGeminiStt(model, b64, withThinking, timeoutMs) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
+    `:generateContent?key=${encodeURIComponent(GEMINI_KEY)}`;
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: STT_PROMPT_GEMINI },
+            { inlineData: { mimeType: 'audio/wav', data: b64 } },
+          ],
+        },
+      ],
+      generationConfig: geminiSttConfig(withThinking),
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/** يفرّغ wav (16kHz mono) عبر Gemini — أدق للهجات من Whisper */
+async function transcribeGemini(wav) {
+  if (!GEMINI_KEY) throw new Error('ما فيه مفتاح Gemini للتفريغ');
+  const models = GEMINI_STT_MODELS.filter((m) => {
+    const until = geminiSttCool.get(m) || 0;
+    return Date.now() >= until;
+  });
+  if (!models.length) throw new Error('كل موديلات Gemini للتفريغ في فترة توقف');
+
+  const b64 = wav.toString('base64');
+  const timeoutMs = Number(process.env.STT_TIMEOUT_MS || 25000);
+  let lastErr = null;
+
+  for (const model of models) {
+    try {
+      const t0 = Date.now();
+      let res = await callGeminiStt(model, b64, true, timeoutMs);
+      // لو الموديل ما يقبل إعداد التفكير نعيد بدونها
+      if (res.status === 400) {
+        const probe = await res.clone().text().catch(() => '');
+        if (/thinking/i.test(probe)) res = await callGeminiStt(model, b64, false, timeoutMs);
+      }
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        const err = new Error(`Gemini STT ${res.status}: ${txt.slice(0, 160)}`);
+        err.status = res.status;
+        throw err;
+      }
+
+      const data = await res.json();
+      const raw = (data?.candidates?.[0]?.content?.parts || [])
+        .map((p) => p.text)
+        .filter(Boolean)
+        .join('')
+        .trim();
+
+      let text = '';
+      let unclear = false;
+      let parsed = false;
+      try {
+        const j = JSON.parse(raw);
+        if (j && typeof j === 'object') {
+          text = String(j.transcript || '').trim();
+          unclear = Boolean(j.unclear);
+          parsed = true;
+        }
+      } catch {
+        /* مو JSON */
+      }
+
+      // رد مقطوع/غير صالح (يصير مع الموديلات التجريبية) → نجرّب الموديل التالي
+      if (!parsed) {
+        const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+        if (!cleaned) {
+          geminiSttCool.set(model, Date.now() + 60 * 1000);
+          throw new Error('رد Gemini فاضي');
+        }
+        if (/^[{[]/.test(cleaned) || /"(transcript|unclear)"\s*:/.test(cleaned)) {
+          geminiSttCool.set(model, Date.now() + 2 * 60 * 1000);
+          throw new Error(`رد Gemini مو JSON صالح: ${cleaned.slice(0, 60)}`);
+        }
+        text = cleaned;
+      }
+
+      // تعليقات وصفية بدل تفريغ (يصير لو المقطع همس/غير مفهوم)
+      if (/التسجيل|المقطع الصوتي|لا أستطيع|لا استطيع|لا يمكنني تفريغ|لم أسمع/.test(text)) {
+        log(`🙈 رد Gemini وصفي (مو تفريغ): "${text.slice(0, 70)}"`);
+        return { text: '', junk: true, source: 'gemini', unclear: true };
+      }
+
+      log(`🎧 تفريغ Gemini (${model}، ${Date.now() - t0}ms): "${text.slice(0, 80)}"${unclear ? ' [غير واضح]' : ''}`);
+      if (unclear || !text || isJunkTranscript(text)) {
+        return { text: '', junk: true, source: 'gemini', unclear };
+      }
+      return { text, source: 'gemini' };
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e.message || e);
+      const quota = /\b429\b|quota|exceeded|RESOURCE_EXHAUSTED|rate.?limit/i.test(msg);
+      geminiSttCool.set(model, Date.now() + (quota ? 30 * 60 * 1000 : 2 * 60 * 1000));
+      log(`⚠️ فشل تفريغ Gemini (${model}): ${msg.slice(0, 110)}`);
+    }
+  }
+  throw lastErr || new Error('فشل تفريغ Gemini');
+}
+
+/** تفريغ Whisper (احتياطي) مع فحص الثقة */
+async function transcribeWhisper(wav, opts = {}) {
+  if (!GROQ_KEY) throw new Error('ما فيه مفتاح Groq');
 
   const form = new FormData();
   form.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
@@ -626,24 +746,111 @@ async function transcribe(opusPackets, opts = {}) {
 
     if (noSpeech > noSpeechMax) {
       log(`🙈 تجاهلت مقطع (يغلب أنه صمت/ضجيج: ${noSpeech.toFixed(2)})، النص كان: "${text.slice(0, 50)}"`);
-      return done({ text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } });
+      return { text: '', junk: true, raw: text, conf: { noSpeech, comp, avgLog }, source: 'whisper' };
     }
     if (comp > compMax) {
       log(`🙈 تجاهلت مقطع (تكرار/هلوسة: ${comp.toFixed(2)})، النص: "${text.slice(0, 50)}"`);
-      return done({ text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } });
+      return { text: '', junk: true, raw: text, conf: { noSpeech, comp, avgLog }, source: 'whisper' };
     }
     if (avgLog < logMin) {
       log(`🙈 تجاهلت مقطع (ثقة واطية: ${avgLog.toFixed(2)})، النص: "${text.slice(0, 50)}"`);
-      return done({ text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } });
+      return { text: '', junk: true, raw: text, conf: { noSpeech, comp, avgLog }, source: 'whisper' };
     }
   }
 
   // نرفض الهلوسة (نصوص اخترعها الموديل على صوت مو كلام)
   if (!text || isJunkTranscript(text)) {
     log(`🚫 تفريغ مرفوض (هلوسة/فاضي): "${text.slice(0, 70)}"`);
-    return done({ text: '', junk: true, raw: text, level });
+    return { text: '', junk: true, raw: text, source: 'whisper' };
   }
-  return done({ text, language: data?.language, level });
+  return { text, language: data?.language, source: 'whisper' };
+}
+
+/**
+ * يفرّغ حزم Opus خام إلى نص.
+ * الترتيب: Gemini أول (أدق بكثير للهجة الخليجية)، وWhisper احتياطي عند فشل/حصة Gemini.
+ * @param {Buffer[]} opusPackets حزم Opus من ديسكورد
+ * @param {object} opts { language, prompt }
+ */
+async function transcribe(opusPackets, opts = {}) {
+  const list = (Array.isArray(opusPackets) ? opusPackets : []).filter((p) => p && p.length > 0);
+  if (!list.length) throw new Error('ما فيه صوت');
+
+  const ogg = muxOggOpus(list, { channels: 2, sampleRate: 48000 });
+  const { wav, level } = await oggToWav(ogg);
+  const seconds = (list.length * 20) / 1000; // كل حزمة Opus ≈ 20ms
+
+  // نحفظ المقطع للتشخيص (نسمع صوت المتحدث الحقيقي عند الحاجة)
+  const rec = rememberCapture({
+    at: Date.now(),
+    seconds,
+    level,
+    wav: wav.length < 400000 ? wav : null,
+    packets: list.length,
+    rate: Math.round(
+      list.reduce((a, p) => a + p.length, 0) / Math.max(1, list.length),
+    ),
+  });
+  const done = (o) => {
+    if (rec) Object.assign(rec, o);
+    return o;
+  };
+  log(
+    `🎚️ مقطع (${seconds.toFixed(1)} ثانية | ${rec ? rec.rate : '?'} بايت/حزمة) مستوى: أعلى ${level.max}dB / متوسط ${level.mean}dB`,
+  );
+
+  // فلتر مهم: الصمت والضجيج = هلوسة. نتجاهل المقطع قبل ما نرسله أصلاً
+  // ملاحظة: dynaudnorm يرفع الصوت الواطي بعد هذي القياسة، فنقبل الأوطأ هنا.
+  const softDb = Number(process.env.STT_MIN_DB || -45);
+  const hardDb = Number(process.env.STT_HARD_DB || -55);
+  const maxDb = level.max;
+  if (maxDb != null && (maxDb <= hardDb || (maxDb <= softDb && seconds > 6))) {
+    log(
+      `🔇 صوت واطي/صمت (أعلى مستوى ${maxDb}dB، ${seconds.toFixed(1)} ثانية) — تجاهلته قبل التفريغ`,
+    );
+    return done({ text: '', quiet: true, level });
+  }
+
+  const order = String(process.env.STT_ORDER || 'gemini,whisper')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  let lastErr = null;
+  for (const provider of order) {
+    try {
+      if (provider === 'gemini') {
+        const r = await transcribeGemini(wav);
+        if (!r.text) {
+          log('🔇 ما فيه كلام واضح (Gemini) — ما أرد');
+          return done({ text: '', junk: true, level, source: 'gemini' });
+        }
+        return done({ text: r.text, level, source: 'gemini' });
+      }
+
+      if (provider === 'whisper') {
+        const r = await transcribeWhisper(wav, opts);
+        if (!r.text) {
+          return done({
+            text: '',
+            junk: true,
+            raw: r.raw,
+            conf: r.conf || null,
+            level,
+            source: 'whisper',
+          });
+        }
+        return done({ text: r.text, language: r.language, level, source: 'whisper' });
+      }
+
+      log(`⚠️ مفرّغ غير معروف في STT_ORDER: ${provider}`);
+    } catch (e) {
+      lastErr = e;
+      log(`⚠️ فشل التفريغ عبر ${provider}: ${String(e.message || e).slice(0, 150)}`);
+    }
+  }
+
+  throw lastErr || new Error('فشل تفريغ الصوت');
 }
 
 // ---------------------------------------------------------------------------
@@ -722,4 +929,8 @@ module.exports = {
   sttNorm,
   captureDebug,
   STT_MODEL,
+  // للفحص المباشر
+  transcribeGemini,
+  transcribeWhisper,
+  GEMINI_STT_MODELS,
 };

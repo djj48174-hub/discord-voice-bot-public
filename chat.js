@@ -117,6 +117,22 @@ function clip(text, max = REPLY_MAX) {
   return t.slice(0, max - 1).trimEnd() + '…';
 }
 
+/** قص للنطق: نفضّل نهاية جملة عشان الصوت ما يطلع مقطوع بنص كلمة */
+function clipSpeech(text, max = VOICE_REPLY_MAX) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (t.length <= max) return t;
+  const head = t.slice(0, max);
+  const cut = Math.max(
+    head.lastIndexOf('؟'),
+    head.lastIndexOf('!'),
+    head.lastIndexOf('.'),
+    head.lastIndexOf('،'),
+  );
+  if (cut >= max * 0.45) return head.slice(0, cut + 1).trim();
+  const sp = head.lastIndexOf(' ');
+  return `${sp > 15 ? head.slice(0, sp) : head}`.trim() + '.';
+}
+
 /** كلمات الرد (بدون كلمات قصيرة/ترقيم) — نقارنها عشان نكشف التكرار */
 function wordsOf(text) {
   return new Set(
@@ -251,7 +267,37 @@ async function tryGeminiModel(model, bodies) {
 // ---------------------------------------------------------------------------
 // Groq (متوافق مع OpenAI)
 // ---------------------------------------------------------------------------
-async function callGroq(model, messages) {
+// موديلات Groq التفكيرية تحرق توكنز "التفكير" وترجع محتوى فاضي (هذا سبب "رد فاضي من Groq")
+function groqExtras(model) {
+  if (/qwen3/i.test(model)) return { reasoning_effort: 'none' }; // بدون تفكير = أسرع وما يرجع فاضي
+  if (/gpt-oss/i.test(model)) return { reasoning_effort: 'low' }; // تفكير قليل = أسرع
+  return {};
+}
+
+async function callGroq(model, messages, opts = {}) {
+  const extras = groqExtras(model);
+  let text = '';
+  try {
+    text = await groqOnce(model, messages, { ...extras, maxTokens: opts.maxTokens });
+  } catch (e) {
+    // لو الموديل ما يعرف إعدادات التفكير نعيد بدونه
+    if (e.status === 400 && /reasoning/i.test(String(e.body || e.message))) {
+      log(`↩️ groq:${model}: ما يقبل إعدادات التفكير — أعيد بدونها`);
+      text = await groqOnce(model, messages, { maxTokens: opts.maxTokens });
+    } else {
+      throw e;
+    }
+  }
+  if (!text && Object.keys(extras).length) {
+    // جرّب مرة ثانية بدون إعدادات التفكير
+    log(`↩️ groq:${model}: رد فاضي — أعيد بدون إعدادات التفكير`);
+    text = await groqOnce(model, messages, { maxTokens: opts.maxTokens });
+  }
+  if (!text) throw new Error('رد فاضي من Groq');
+  return text;
+}
+
+async function groqOnce(model, messages, { maxTokens, ...extras } = {}) {
   await pace();
   const res = await fetch(GROQ_URL, {
     method: 'POST',
@@ -264,7 +310,8 @@ async function callGroq(model, messages) {
       messages,
       temperature: 0.9,
       top_p: 0.95,
-      max_tokens: 800,
+      max_tokens: Number(maxTokens) > 0 ? Number(maxTokens) : 800,
+      ...extras,
     }),
     signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
   });
@@ -282,9 +329,7 @@ async function callGroq(model, messages) {
   }
 
   const data = await res.json();
-  const text = String(data?.choices?.[0]?.message?.content || '').trim();
-  if (!text) throw new Error('رد فاضي من Groq');
-  return text;
+  return String(data?.choices?.[0]?.message?.content || '').trim();
 }
 
 /** يجيب قائمة موديلات Groq المتاحة فعلاً (عشان ما نعتمد على أسماء قديمة) */
@@ -368,7 +413,7 @@ async function askAI(key, text, userLabel, opts = {}) {
       const id = `groq:${model}`;
       if (isExhausted(id)) continue;
       try {
-        const reply = await callGroq(model, groqMessages);
+        const reply = await callGroq(model, groqMessages, { maxTokens });
         workingModel = id;
         return reply;
       } catch (e) {
@@ -414,9 +459,10 @@ const VOICE_PROMPT = `انت «${BOT_NAME}»، تتكلم بصوتك في الر
 
 - ردّك القصير أفضل: جملة واحدة قصيرة (5-12 كلمة)، وبأقصى 90 حرف. لا تطوّل أبداً.
 - تكلم بالعامية السعودية المبسطة وبأسلوب ودي وقريب.
-- جاوب على السؤال مباشرة وبدون مقدمات ولا اعتذار ولا تكرار لسؤاله.
+- جاوب على سؤال اللي يكلمك مباشرة وبدون مقدمات ولا اعتذار ولا تكرار لسؤاله.
 - ممنوع تنسيق Markdown (لا ** ولا * ولا #) وممنوع إيموجي ورموز — النطق ما يفهمها.
-- لو الكلام غير واضح أو ناقص، خمّن أقرب معنى بالسياق ورد عليه بذكاء.
+- لا تخترع معلومات ولا أسماء، ولا تتكلم عن نفسك كأنك تلعب أو تأكل. انت مساعد صوتي.
+- لو الكلام مو مفهوم أبداً قل فقط: "ما سمعتك زين، كررها؟" — لا تخمّن ولا ترد على شي ما قاله.
 - لو طلب أغنية: قل "حاضر، أشغّلها لك" فقط.`;
 
 const VOICE_REPLY_MAX = Math.max(60, Number(process.env.VOICE_REPLY_MAX || 110));
@@ -435,14 +481,14 @@ async function voiceReply({ key, text, userLabel }) {
   try {
     const out = await askAI(key, prompt, userLabel, {
       systemPrompt: VOICE_PROMPT,
-      maxOutputTokens: 200,
+      maxOutputTokens: 220,
     });
-    const clipped = clip(out, VOICE_REPLY_MAX);
+    const clipped = clipSpeech(out, VOICE_REPLY_MAX);
     remember(key, 'model', clipped);
-    return { text: clipped, source: 'ai', speak: true };
+    return { text: clipped, source: 'ai', speak: true, model: workingModel };
   } catch (e) {
     log('⚠️ فشل رد الصوت:', String(e.message).slice(0, 150));
-    return { text: 'ما فهمت زين، كررها مرة ثانية؟', source: 'error', speak: true };
+    return { text: 'ما فهمت زين، كررها مرة ثانية؟', source: 'error', speak: true, model: null };
   }
 }
 

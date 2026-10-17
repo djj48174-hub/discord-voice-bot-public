@@ -573,7 +573,7 @@ function connect(guild, channel) {
           voiceChat.setSpeaking(true);
 
           const reply = await chat.voiceReply({ key: `voice:${u.userId}`, text, userLabel: name });
-          log(`💬 رد (${Date.now() - t0}ms): "${reply.text}"`);
+          log(`💬 رد (${Date.now() - t0}ms${reply.model ? `، ${reply.model}` : ''}): "${reply.text}"`);
 
           const m = music.getQueue(guild.id);
           try {

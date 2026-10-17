@@ -720,6 +720,12 @@ client.once('ready', async () => {
     .then((ogg) => log(`✅ محرّك النطق شغّال (${ogg.length} بايت)`))
     .catch((e) => log('❌ محرّك النطق ما يشتغل:', String(e.message).slice(0, 160)));
 
+  // فحص التفريغ (Gemini أولاً ثم Whisper) — يولّد جملة ويكشفها، يبيّن لنا وش شغّال بالسيرفر
+  speech
+    .selfTest()
+    .then((r) => log(`🧪 فحص التفريغ: ${r?.stt?.ok ? 'شغّال' : 'مشكلة — ' + (r?.stt?.error || 'غير معروف')}`))
+    .catch((e) => log('⚠️ فحص التفريغ فشل:', String(e.message).slice(0, 140)));
+
   if (VOICE_CHANNEL_ID) {
     await ensureConnected();
   } else {

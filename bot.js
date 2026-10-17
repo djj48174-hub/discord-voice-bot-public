@@ -54,7 +54,9 @@ let autoRejoin = true;   // يتوقف لما تكتب /leave
 let joinTimer = null;    // مؤقت إعادة الدخول
 let lastJoinAt = 0;      // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
 let voiceChat = null;    // وحدة المحادثة الصوتية (سماع المتكلمين)
-let voiceBusy = false;   // البوت يرد حالياً — نتجاهل المقاطع الجديدة
+let voiceBusy = false;   // البوت يرد حالياً — نحفظ الكلام الجديد ونرد عليه بعدين
+let pendingVoice = null; // آخر كلام وصل والبوت مشغول (عشان ما نفقده)
+let lastSpokenText = ''; // آخر شي نطقه البوت (نكشف صدى صوتنا)
 // الرد الصوتي شغّال ولا متوقف (ينشغّل/ينوقف بأمر بالكلام أو بالكتابة أو بـ /voice)
 let voiceChatOn = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
 
@@ -461,104 +463,130 @@ function connect(guild, channel) {
     // نفعّل السماع للمحادثة الصوتية
     try {
       if (voiceChat) voiceChat.stop();
+      // معالجة كلام المستخدم — نستدعيها من الطابور تحت (واحد في كل مرة)
+      const handleVoice = async (u) => {
+        voiceBusy = true;
+        const t0 = Date.now();
+        try {
+          const said = await speech.transcribe(u.packets, { language: 'ar' });
+          if (!said.text || said.text.trim().length < 2) {
+            log(`🔇 ما فيه كلام واضح — ما أرد (${u.count} حزمة)`);
+            return;
+          }
+
+          const wake = (process.env.VOICE_WAKE_WORD || '').trim();
+          const text = wake ? said.text.replace(wake, '').trim() : said.text.trim();
+          if (!text) return;
+
+          // لو المقطع جاء وقت البوت يتكلم وكان نفسه كلام البوت = صدى صوتنا، نتجاهله
+          if (u.duringSpeech && looksLikeEcho(text, lastSpokenText)) {
+            log(`🔁 تجاهلت صدى صوتي: "${text.slice(0, 60)}"`);
+            return;
+          }
+
+          log(`🗣️ سمعت (${Date.now() - t0}ms): "${text}"`);
+
+          const name =
+            guild.members?.cache?.get(u.userId)?.displayName ||
+            guild.members?.cache?.get(u.userId)?.user?.username ||
+            'صديقي';
+
+          // 1) هل هو أمر صوتي (شغّل / وقف الرد الصوتي)؟
+          const intent = voiceToggleIntent(text);
+          if (intent) {
+            const wasOn = voiceChatOn;
+            setVoiceChat(intent === 'on', `بالكلام من ${name}`);
+            voiceChat.setSpeaking(true);
+            try {
+              if (wasOn !== voiceChatOn || intent === 'on') {
+                await speakLine(
+                  guild,
+                  intent === 'on'
+                    ? 'تم، شغلت الرد الصوتي. تفضل تكلم وأنا معك.'
+                    : 'تم، وقفت الرد الصوتي. لو تبي أرجعه قل: شغل الرد الصوتي.',
+                );
+              }
+            } catch (e) {
+              log('⚠️ ما قدرت أأكد الأمر بالصوت:', String(e.message).slice(0, 120));
+            } finally {
+              voiceChat.setSpeaking(false);
+            }
+            return;
+          }
+
+          // 2) الرد الصوتي متوقف؟ نتجاهل الكلام (بس نظل نسمع عشان أمر التشغيل)
+          if (!voiceChatOn) {
+            log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
+            return;
+          }
+
+          // 3) أوامر الروم بالصوت (شغّل أغنية / اطلع / وقف / التالي / الصوت)
+          let vcmd = null;
+          try {
+            vcmd = await runVoiceCommand(guild, text);
+          } catch (e) {
+            log('⚠️ خطأ في الأمر الصوتي:', String(e.message).slice(0, 140));
+          }
+          if (vcmd) {
+            log(`🎛️ أمر صوتي: "${text}"`);
+            voiceChat.setSpeaking(true);
+            try {
+              if (vcmd.say) await speakLine(guild, forSpeech(vcmd.say));
+            } catch (e) {
+              log('⚠️ ما قدرت أنطق التأكيد:', String(e.message).slice(0, 120));
+            } finally {
+              voiceChat.setSpeaking(false);
+            }
+            if (typeof vcmd.after === 'function') {
+              try {
+                await vcmd.after();
+              } catch (e) {
+                log('⚠️ تنفيذ الأمر الصوتي:', String(e.message).slice(0, 140));
+              }
+            }
+            return;
+          }
+
+          voiceChat.setSpeaking(true);
+
+          const reply = await chat.voiceReply({ key: `voice:${u.userId}`, text, userLabel: name });
+          log(`💬 رد (${Date.now() - t0}ms): "${reply.text}"`);
+
+          const m = music.getQueue(guild.id);
+          try {
+            const dv = music.connDave(conn);
+            log(
+              `🎧 التشفير (DAVE): ${dv?.session?.ready ? 'جاهز' : 'غير جاهز'} (v${dv?.protocolVersion ?? '?'})`,
+            );
+          } catch {
+            /* ignore */
+          }
+          const stream = await speech.speak(reply.text);
+          lastSpokenText = reply.text;
+          const played = await m.speak(stream, 1);
+          log(`🔊 نطقنا (${Date.now() - t0}ms) — تشغيل=${played ? 'نجح' : 'ما وصل'}`);
+        } catch (e) {
+          log('⚠️ فشل الرد الصوتي:', String(e.message).slice(0, 150));
+        } finally {
+          voiceChat.setSpeaking(false);
+          voiceBusy = false;
+        }
+      };
+
       voiceChat = new VoiceChat(conn, {
         onUtterance: async (u) => {
-          if (voiceBusy) return;
-          voiceBusy = true;
-          const t0 = Date.now();
-          try {
-            const said = await speech.transcribe(u.packets, { language: 'ar' });
-            if (!said.text || said.text.trim().length < 2) return;
-
-            const wake = (process.env.VOICE_WAKE_WORD || '').trim();
-            const text = wake ? said.text.replace(wake, '').trim() : said.text.trim();
-            if (!text) return;
-
-            log(`🗣️ سمعت (${Date.now() - t0}ms): "${text}"`);
-
-            const name =
-              guild.members?.cache?.get(u.userId)?.displayName ||
-              guild.members?.cache?.get(u.userId)?.user?.username ||
-              'صديقي';
-
-            // 1) هل هو أمر صوتي (شغّل / وقف الرد الصوتي)؟
-            const intent = voiceToggleIntent(text);
-            if (intent) {
-              const wasOn = voiceChatOn;
-              setVoiceChat(intent === 'on', `بالكلام من ${name}`);
-              voiceChat.setSpeaking(true);
-              try {
-                if (wasOn !== voiceChatOn || intent === 'on') {
-                  await speakLine(
-                    guild,
-                    intent === 'on'
-                      ? 'تم، شغلت الرد الصوتي. تفضل تكلم وأنا معك.'
-                      : 'تم، وقفت الرد الصوتي. لو تبي أرجعه قل: شغل الرد الصوتي.',
-                  );
-                }
-              } catch (e) {
-                log('⚠️ ما قدرت أأكد الأمر بالصوت:', String(e.message).slice(0, 120));
-              } finally {
-                voiceChat.setSpeaking(false);
-              }
-              return;
-            }
-
-            // 2) الرد الصوتي متوقف؟ نتجاهل الكلام (بس نظل نسمع عشان أمر التشغيل)
-            if (!voiceChatOn) {
-              log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
-              return;
-            }
-
-            // 3) أوامر الروم بالصوت (شغّل أغنية / اطلع / وقف / التالي / الصوت)
-            let vcmd = null;
-            try {
-              vcmd = await runVoiceCommand(guild, text);
-            } catch (e) {
-              log('⚠️ خطأ في الأمر الصوتي:', String(e.message).slice(0, 140));
-            }
-            if (vcmd) {
-              log(`🎛️ أمر صوتي: "${text}"`);
-              voiceChat.setSpeaking(true);
-              try {
-                if (vcmd.say) await speakLine(guild, forSpeech(vcmd.say));
-              } catch (e) {
-                log('⚠️ ما قدرت أنطق التأكيد:', String(e.message).slice(0, 120));
-              } finally {
-                voiceChat.setSpeaking(false);
-              }
-              if (typeof vcmd.after === 'function') {
-                try {
-                  await vcmd.after();
-                } catch (e) {
-                  log('⚠️ تنفيذ الأمر الصوتي:', String(e.message).slice(0, 140));
-                }
-              }
-              return;
-            }
-
-            voiceChat.setSpeaking(true);
-
-            const reply = await chat.voiceReply({ key: `voice:${u.userId}`, text, userLabel: name });
-            log(`💬 رد (${Date.now() - t0}ms): "${reply.text}"`);
-
-            const m = music.getQueue(guild.id);
-            try {
-              const dv = music.connDave(conn);
-              log(
-                `🎧 التشفير (DAVE): ${dv?.session?.ready ? 'جاهز' : 'غير جاهز'} (v${dv?.protocolVersion ?? '?'})`,
-              );
-            } catch {
-              /* ignore */
-            }
-            const stream = await speech.speak(reply.text);
-            const played = await m.speak(stream, 1);
-            log(`🔊 نطقنا (${Date.now() - t0}ms) — تشغيل=${played ? 'نجح' : 'ما وصل'}`);
-          } catch (e) {
-            log('⚠️ فشل الرد الصوتي:', String(e.message).slice(0, 150));
-          } finally {
-            voiceChat.setSpeaking(false);
-            voiceBusy = false;
+          if (voiceBusy) {
+            // البوت مشغول — نحفظ آخر كلام عشان نرد عليه بعد ما نخلص (بدل ما نرميه)
+            pendingVoice = u;
+            log('⏳ البوت مشغول — بحفظ كلامك وأرد عليه بعد ما أخلص ردي');
+            return;
+          }
+          await handleVoice(u);
+          // نعالج آخر كلام وصل أثناء الرد
+          while (pendingVoice) {
+            const next = pendingVoice;
+            pendingVoice = null;
+            await handleVoice(next);
           }
         },
       });
@@ -936,9 +964,24 @@ function setVoiceChat(on, by = '') {
 
 /** ينطق جملة قصيرة (تأكيد أمر صوتي) */
 async function speakLine(guild, line) {
+  lastSpokenText = line;
   const m = music.getQueue(guild.id);
   const ogg = await speech.speak(line);
   return m.speak(ogg, 1);
+}
+
+/** هل النص يبدو صدى لكلام البوت نفسه؟ (نمنع البوت يرد على صوته) */
+function looksLikeEcho(text, botText) {
+  const a = normAr(text);
+  const b = normAr(botText);
+  if (!a || !b) return false;
+  if (a.length >= 6 && b.includes(a)) return true;
+  if (b.length >= 6 && a.includes(b)) return true;
+  const wa = new Set(a.split(' ').filter((w) => w.length > 2));
+  const wb = b.split(' ').filter((w) => w.length > 2);
+  if (!wa.size || !wb.length) return false;
+  const hit = wb.filter((w) => wa.has(w)).length;
+  return hit / wb.length >= 0.6;
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1099,8 @@ async function runVoiceCommand(guild, rawText) {
     return {
       say: `طيب، اطلع من ${chName}. لو تبي أرجع قول: ادخل الروم.`,
       after: async () => {
-        await new Promise((r) => setTimeout(r, 1500));
+        await new Promise((r) => setTimeout(r, 2500));
+        autoRejoin = false;
         try {
           getVoiceConnection(guild.id)?.destroy();
         } catch {
@@ -1470,5 +1514,5 @@ if (require.main === module) {
   });
 } else {
   // يسمح باختبار الأوامر الصوتية بدون تشغيل البوت (test-voicecmd.js)
-  module.exports = { normAr, voiceToggleIntent, forSpeech, runVoiceCommand };
+  module.exports = { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho };
 }

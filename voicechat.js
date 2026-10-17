@@ -92,8 +92,9 @@ class VoiceChat {
   }
 
   _beginSegment(userId) {
-    if (this.speaking) return; // البوت يتكلم — لا نسجل
     if (this.subs.has(userId)) return; // نتكلم عليه أصلاً
+    // ملاحظة: لو البوت يتكلم حالياً نظل نسجّل المقطع (duringSpeech)
+    // عشان كلام المستخدم ما يضيع، والبوت يقرر بعدين إذا يتجاهله.
 
     let stream;
     try {
@@ -130,7 +131,8 @@ class VoiceChat {
 
       log(
         `🎤 مقطع: ${packets} حزمة | ${bytes} بايت | ${seconds.toFixed(1)} ثانية` +
-          (bytes / Math.max(0.1, seconds) < 2000 ? ' ⚠️ معدل منخفض' : ''),
+          (bytes / Math.max(0.1, seconds) < 2000 ? ' ⚠️ معدل منخفض' : '') +
+          (this.speaking ? ' (البوت يتكلم)' : ''),
       );
       if (this.onUtterance) {
         try {
@@ -141,6 +143,7 @@ class VoiceChat {
             seconds,
             count: packets,
             enabled: this.enabled,
+            duringSpeech: this.speaking,
           });
         } catch (e) {
           log('⚠️ خطأ في معالجة المقطع:', e.message);

@@ -4,7 +4,8 @@
  */
 'use strict';
 
-const { normAr, voiceToggleIntent, forSpeech, runVoiceCommand } = require('./bot');
+const { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho } = require('./bot');
+const { isJunkTranscript } = require('./speech');
 
 const guild = {
   id: 'test-guild-0',
@@ -45,6 +46,18 @@ async function main() {
 
   section('تنقية النطق (forSpeech)');
   ok(forSpeech('▶️ شغّالة الآن: **فنان - أغنية** 🎧') === 'شغّالة الآن فنان أغنية', 'نشيل الرموز والإيموجي', forSpeech('▶️ شغّالة الآن: **فنان - أغنية** 🎧'));
+
+  section('فلتر الهلوسة (isJunkTranscript)');
+  ok(isJunkTranscript('ترجمة نانسي قنقر') === true, '«ترجمة نانسي قنقر» = هلوسة');
+  ok(isJunkTranscript('أمثلة تدريبية عامية بين شخص وبوت ديسكورد.') === true, 'نص التلميح = هلوسة');
+  ok(isJunkTranscript('المزيد من الفيديوهات') === true, '«المزيد من الفيديوهات» = هلوسة');
+  ok(isJunkTranscript('') === true, 'الفاضي = مرفوض');
+  ok(isJunkTranscript('شغّل أغنية Love and Cut Walk') === false, 'طلب أغنية = كلام حقيقي');
+  ok(isJunkTranscript('هلا وش أخبارك اليوم') === false, 'كلام عادي = حقيقي');
+
+  section('كشف صدى صوت البوت (looksLikeEcho)');
+  ok(looksLikeEcho('حاضر أشغلها لك', 'طيب، حاضر أشغلها لك') === true, 'نفس كلام البوت = صدى');
+  ok(looksLikeEcho('هلا وش أخبارك', 'طيب، شغالة الآن أغنية') === false, 'كلام مختلف = مو صدى');
 
   section('أوامر الروم بالصوت (runVoiceCommand)');
   const cases = [

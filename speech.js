@@ -24,13 +24,67 @@ const GROQ_KEY = (process.env.GROQ_API_KEY || '').trim();
 // whisper-large-v3 أدق للعامية الخليجية (turbo أسرع لكنه يغلط أكثر)
 const STT_MODEL = (process.env.STT_MODEL || 'whisper-large-v3').trim();
 const STT_TIMEOUT_MS = Math.max(5000, Number(process.env.STT_TIMEOUT_MS || 25000));
-// تلميح يساعد Whisper يفهم العامية السعودية وأسماء الأشياء عندنا
-const STT_PROMPT = (
-  process.env.STT_PROMPT ||
-  'محادثة صوتية سعودية عامية بين شخص وبوت ديسكورد. أمثلة: وش أخبارك، من اللي سواك، شغّل لي أغنية، اطلع من الروم، تبي قهوة، كيف حالك اليوم.'
-).trim();
+// تلميح اختياري لـ Whisper.
+// ⚠️ تحذير مهم: التلميح الطويل يخلي الموديل "يهلوس" ويردّد نص التلميح على الصمت
+// (شفناه في التشغيل: طلع "أمثلة تدريبية عامية بين شخص وبوت ديسكورد") — فخليه فاضي.
+const STT_PROMPT = (process.env.STT_PROMPT || '').trim();
+
+// جُمل يخترعها Whisper على الصمت/الضجيج — نتجاهلها
+const STT_JUNK = [
+  'ترجمه نانسي قنقر',
+  'ترجمه نانسي',
+  'المزيد من الفيديوهات',
+  'اشترك في القناه',
+  'شكرا على المشاهده',
+  'محادثه صوتيه سعوديه',
+  'بوت ديسكورد',
+  'امثله عاميه',
+  'امثله تدريبيه',
+  'خيالتان رائعه',
+  'الترجمه من',
+  'ترجمه من',
+  'لا تنسى الاشتراك',
+  'شكرا لكم',
+];
+
+/** تنظيف نص للمقارنة */
+function sttNorm(s) {
+  return String(s || '')
+    .replace(/[\u064B-\u0652\u0670\u0640]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+const STT_JUNK_NORM = STT_JUNK.map(sttNorm);
+
+/** هل النص هلوسة/كلام فاضي (مو كلام حقيقي)؟ */
+function isJunkTranscript(text) {
+  const t = sttNorm(text);
+  if (!t) return true;
+  if (STT_JUNK_NORM.some((j) => j && t.includes(j))) return true;
+  // لو النص كله مأخوذ من التلميح = هلوسة
+  const p = sttNorm(STT_PROMPT);
+  if (p) {
+    const words = t.split(' ').filter((w) => w.length > 2);
+    if (words.length && words.every((w) => p.includes(w))) return true;
+  }
+  return false;
+}
 
 const TTS_RATE = (process.env.TTS_RATE || '+8%').trim();
+// سرعة النطق (1 = عادي) — نسرّع شوي عشان الرد يوصل أسرع (بدون ما يتغيّر الصوت)
+const TTS_SPEED = Math.max(0.8, Math.min(1.5, Number(process.env.TTS_SPEED || 1.12)));
+
+/** فلتر ffmpeg لتسريع الكلام بدون تغيير النبرة */
+function ttsSpeedFilter(speed = TTS_SPEED) {
+  if (!speed || Math.abs(speed - 1) < 0.02) return '';
+  return `atempo=${speed.toFixed(2)}`;
+}
 
 // أصوات عربية *رجالية* فقط — نحافظ على هوية صوتية واحدة ثابتة للبوت
 const MALE_ARABIC_VOICES = [
@@ -210,8 +264,11 @@ async function speakGoogle(text) {
   const mp3 = Buffer.from(await res.arrayBuffer());
   if (mp3.length < 500) throw new Error('صوت فاضي من Google TTS');
   // صوت قوقل نسائي -> ننزّل النبرة عشان يصير رجالي (احتياطي أخير فقط)
-  const maleShift = extraFilterMale(process.env.GOOGLE_TTS_MALE === 'false' ? '' : 'google');
-  return toDiscordOgg(mp3, maleShift);
+  const filters = [
+    extraFilterMale(process.env.GOOGLE_TTS_MALE === 'false' ? '' : 'google'),
+    ttsSpeedFilter(),
+  ].filter(Boolean);
+  return toDiscordOgg(mp3, filters.join(','));
 }
 
 /** فلتر تنزيل النبرة (رجالي) — يُستخدم للاحتياطي النسائي فقط */
@@ -328,28 +385,29 @@ async function speakGroq(text, opts = {}) {
 
   const wav = Buffer.from(await res.arrayBuffer());
   if (wav.length < 500) throw new Error('صوت فاضي من Groq TTS');
-  return toDiscordOgg(wav);
+  return toDiscordOgg(wav, ttsSpeedFilter());
 }
 
 // ---------------------------------------------------------------------------
 // STT — تفريغ الصوت إلى نص
 // ---------------------------------------------------------------------------
-/** Ogg Opus -> WAV (16kHz مونو — الأفضل لـ Whisper) */
+/** Ogg Opus -> WAV (16kHz مونو — الأفضل لـ Whisper) + قياس مستوى الصوت */
 function oggToWav(ogg) {
   return new Promise((resolve, reject) => {
     const ff = spawn(
       ffmpegPath(),
       [
         '-hide_banner',
+        // info مهمة عشان volumedetect يطبع المستوى
         '-loglevel',
-        'error',
+        'info',
         '-f',
         'ogg',
         '-i',
         'pipe:0',
-        // ننظّف الصوت ونعدّل مستواه عشان Whisper يفهم أحسن (المايك الواطي = فهم غلط)
+        // ننظّف الصوت، ونقيس مستواه *قبل* التعديل، بعدها نعدّله عشان Whisper يفهم أحسن
         '-af',
-        'highpass=f=70,dynaudnorm=f=200:g=12:p=0.9',
+        'highpass=f=70,volumedetect,dynaudnorm=f=200:g=12:p=0.9',
         '-ar',
         '16000',
         '-ac',
@@ -367,13 +425,19 @@ function oggToWav(ogg) {
     ff.stderr.on('data', (d) => err.push(d));
     ff.on('error', (e) => reject(e));
     ff.on('close', (code) => {
+      const errTxt = Buffer.concat(err).toString();
       if (code !== 0) {
-        reject(new Error(`ffmpeg: ${Buffer.concat(err).toString().trim().slice(0, 200) || 'exit ' + code}`));
+        reject(new Error(`ffmpeg: ${errTxt.trim().slice(-250) || 'exit ' + code}`));
         return;
       }
       const wav = Buffer.concat(out);
       if (wav.length < 100) return reject(new Error('الصوت فاضي بعد التحويل'));
-      resolve(wav);
+      const mx = /max_volume:\s*(-?[\d.]+) dB/.exec(errTxt);
+      const mn = /mean_volume:\s*(-?[\d.]+) dB/.exec(errTxt);
+      resolve({
+        wav,
+        level: { max: mx ? Number(mx[1]) : null, mean: mn ? Number(mn[1]) : null },
+      });
     });
     ff.stdin.on('error', () => {});
     ff.stdin.end(ogg);
@@ -391,7 +455,20 @@ async function transcribe(opusPackets, opts = {}) {
   if (!list.length) throw new Error('ما فيه صوت');
 
   const ogg = muxOggOpus(list, { channels: 2, sampleRate: 48000 });
-  const wav = await oggToWav(ogg);
+  const { wav, level } = await oggToWav(ogg);
+
+  // فلتر مهم: الصمت والضجيج = هلوسة. نتجاهل المقطع قبل ما نرسله أصلاً
+  // قاعدة آمنة: نقبل الصوت الواطي القصير (يمكن كلامك فعلاً)، ونرفض الصمت أو الضجيج الطويل
+  const softDb = Number(process.env.STT_MIN_DB || -38);
+  const hardDb = Number(process.env.STT_HARD_DB || -50);
+  const seconds = (list.length * 20) / 1000; // كل حزمة Opus ≈ 20ms
+  const maxDb = level.max;
+  if (maxDb != null && (maxDb <= hardDb || (maxDb <= softDb && seconds > 6))) {
+    log(
+      `🔇 صوت واطي/صمت (أعلى مستوى ${maxDb}dB، ${seconds.toFixed(1)} ثانية) — تجاهلته قبل التفريغ`,
+    );
+    return { text: '', quiet: true, level };
+  }
 
   const form = new FormData();
   form.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
@@ -419,8 +496,12 @@ async function transcribe(opusPackets, opts = {}) {
 
   const data = await res.json();
   const text = String(data?.text || '').trim();
-  if (!text) throw new Error('ما فهمت شي من الصوت');
-  return { text, language: data?.language };
+  // نرفض الهلوسة (نصوص اخترعها الموديل على صوت مو كلام)
+  if (!text || isJunkTranscript(text)) {
+    log(`🚫 تفريغ مرفوض (هلوسة/فاضي): "${text.slice(0, 70)}"`);
+    return { text: '', junk: true, raw: text, level };
+  }
+  return { text, language: data?.language, level };
 }
 
 // ---------------------------------------------------------------------------
@@ -468,8 +549,13 @@ async function selfTest() {
       });
 
       const r = await transcribe(packets, { language: 'ar' });
-      out.stt = { ok: true, text: r.text, model: STT_MODEL };
-      log(`✅ التفريغ يشتغل (${STT_MODEL}): "${r.text}"`);
+      if (!r.text) {
+        out.stt = { ok: false, error: r.quiet ? 'صوت واطي جداً' : 'تفريغ فاضي' };
+        log('⚠️ التفريغ رجّع نص فاضي — تأكد من STT_MIN_DB أو الصوت');
+      } else {
+        out.stt = { ok: true, text: r.text, model: STT_MODEL };
+        log(`✅ التفريغ يشتغل (${STT_MODEL}): "${r.text}"`);
+      }
     } catch (e) {
       out.stt = { ok: false, error: e.message };
       log('❌ التفريغ فشل:', e.message.slice(0, 150));
@@ -479,4 +565,18 @@ async function selfTest() {
   return out;
 }
 
-module.exports = { speak, transcribe, selfTest, nextVoice, ffmpegPath, oggToWav, testTone, speakGoogle, toDiscordOgg };
+module.exports = {
+  speak,
+  transcribe,
+  selfTest,
+  nextVoice,
+  ffmpegPath,
+  oggToWav,
+  testTone,
+  speakGoogle,
+  toDiscordOgg,
+  // للفحص (test-voicecmd.js)
+  isJunkTranscript,
+  sttNorm,
+  STT_MODEL,
+};

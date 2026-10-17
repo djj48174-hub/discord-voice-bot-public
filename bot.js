@@ -378,6 +378,27 @@ healthServer.listen(HEALTH_PORT, () => {
 });
 
 // ---------------------------------------------------------------------------
+// منبّه ذاتي (لـ Render/Koyeb): يزور نفسه كل ٥ دقايق عشان ما ينام من قلة الزيارات
+// ---------------------------------------------------------------------------
+const SELF_URL = (process.env.SELF_PING_URL || process.env.RENDER_EXTERNAL_URL || '').trim();
+if (SELF_URL && String(process.env.SELF_PING || 'true').toLowerCase() !== 'false') {
+  const everyMs = Math.max(60, Number(process.env.SELF_PING_SECONDS || 300)) * 1000;
+  const ping = async () => {
+    try {
+      const res = await fetch(`${SELF_URL.replace(/\/$/, '')}/health`, {
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) log(`🔔 منبّه ذاتي: رد غير متوقع ${res.status}`);
+    } catch (e) {
+      log(`🔔 منبّه ذاتي فشل: ${String(e.message).slice(0, 90)}`);
+    }
+  };
+  setTimeout(ping, 45000);
+  setInterval(ping, everyMs);
+  log(`🔔 المنبّه الذاتي شغّال كل ${Math.round(everyMs / 1000)} ثانية على ${SELF_URL}`);
+}
+
+// ---------------------------------------------------------------------------
 // منطق الصوت
 // ---------------------------------------------------------------------------
 function scheduleJoin(delayMs = 5000) {

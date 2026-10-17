@@ -1,0 +1,41 @@
+# Render Blueprint — نشر البوت مجاناً بدون بطاقة (خطة free)
+# الاستخدام: Render → New → Blueprint → اختر هذا المستودع → املأ المتغيرات السرية.
+# أو أنشئ الخدمة من الـ API واملأ نفس المتغيرات.
+services:
+  - type: web
+    name: discord-voice-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: frankfurt # الأقرب لسيرفرات ديسكورد الصوتية للخليج (بدائل: ohio، virginia، oregon)
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # ---- أسرار (املأها من لوحة Render) ----
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: VOICE_CHANNEL_ID
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY2
+        sync: false
+      - key: DIAG_KEY
+        sync: false
+      # ---- إعدادات ----
+      - key: NODE_ENV
+        value: production
+      - key: FFMPEG_PATH
+        value: /usr/bin/ffmpeg
+      - key: STT_ORDER
+        value: gemini,whisper
+      - key: TTS_ORDER
+        value: edge,groq,google
+      - key: VOICE_CHAT
+        value: "true"
+      - key: SELF_PING
+        value: "true"

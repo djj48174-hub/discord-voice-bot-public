@@ -1355,6 +1355,10 @@ async function handleInteraction(interaction, opts) {
 
     let channel = interaction.member?.voice?.channel || null;
     if (!channel) {
+      // الروم اللي البوت قاعد فيه بهذا السيرفر
+      channel = guild.members?.me?.voice?.channel || null;
+    }
+    if (!channel) {
       const targetId = opts?.defaultChannelId;
       if (targetId) {
         channel =

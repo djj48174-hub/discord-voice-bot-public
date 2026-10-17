@@ -19,6 +19,7 @@ const {
   ChannelType,
   SlashCommandBuilder,
   Routes,
+  PermissionFlagsBits,
 } = require('discord.js');
 
 const {
@@ -51,13 +52,32 @@ const CHAT_ENABLED = String(process.env.CHAT_ENABLED || 'true').toLowerCase() !=
 const MSG_CONTENT =
   String(process.env.ENABLE_MESSAGE_CONTENT || 'false').toLowerCase() === 'true';
 
-let autoRejoin = true;   // يتوقف لما تكتب /leave
-let joinTimer = null;    // مؤقت إعادة الدخول
-let lastJoinAt = 0;      // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
-let voiceChat = null;    // وحدة المحادثة الصوتية (سماع المتكلمين)
-let voiceBusy = false;   // البوت يرد حالياً — نحفظ الكلام الجديد ونرد عليه بعدين
-let pendingVoice = null; // آخر كلام وصل والبوت مشغول (عشان ما نفقده)
-let lastSpokenText = ''; // آخر شي نطقه البوت (نكشف صدى صوتنا)
+// حالة كل سيرفر على حدة — البوت يخدم أكثر من سيرفر في نفس الوقت
+const guildState = new Map();
+function gs(guildId) {
+  const id = String(guildId || '');
+  let s = guildState.get(id);
+  if (!s) {
+    s = {
+      voiceChat: null, // وحدة المحادثة الصوتية (سماع المتكلمين)
+      autoRejoin: true, // يتوقف لما تكتب /leave
+      joinTimer: null, // مؤقت إعادة الدخول
+      lastJoinAt: 0, // وقت آخر محاولة دخول (عشان ما نكررها بسرعة)
+      channelId: null, // الروم الصوتي اللي قعد فيه بهذا السيرفر
+      busy: false, // البوت يرد حالياً — نحفظ الكلام الجديد ونرد عليه بعدين
+      pending: null, // آخر كلام وصل والبوت مشغول (عشان ما نفقده)
+      lastSpoken: '', // آخر شي نطقه البوت (نكشف صدى صوتنا)
+    };
+    guildState.set(id, s);
+  }
+  return s;
+}
+
+/** الروم الصوتي اللي البوت قاعد فيه فعلياً الآن */
+function botChannelOf(guild) {
+  return guild?.members?.me?.voice?.channel ?? null;
+}
+
 // الرد الصوتي شغّال ولا متوقف (ينشغّل/ينوقف بأمر بالكلام أو بالكتابة أو بـ /voice)
 let voiceChatOn = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
 
@@ -145,7 +165,7 @@ const healthServer = http.createServer(async (req, res) => {
               encryptionMode: cd?.encryptionMode ?? null,
               daveProtocol: dave?.protocolVersion ?? null,
               daveReady: dave?.session?.ready ?? false,
-              voiceChat: voiceChat ? voiceChat.stats : null,
+              voiceChat: gs(g.id).voiceChat ? gs(g.id).voiceChat.stats : null,
               voiceDebug: music.getVoiceDebug(50),
               captures: speech.captureDebug(u.searchParams.get('audio') === '1'),
             },
@@ -348,7 +368,18 @@ const healthServer = http.createServer(async (req, res) => {
           ? guild.channels.cache.get(inChannelId)?.name ?? inChannelId
           : null,
         uptime: Math.round(process.uptime()),
-        voiceChat: voiceChat ? voiceChat.stats : null,
+        voiceChat: guild && gs(guild.id).voiceChat ? gs(guild.id).voiceChat.stats : null,
+        guilds: [...client.guilds.cache.values()].map((g2) => ({
+          id: g2.id,
+          name: g2.name,
+          channel:
+            botChannelOf(g2)?.name ?? null,
+          channelId: botChannelOf(g2)?.id ?? null,
+          connState: getVoiceConnection(g2.id)?.state?.status ?? null,
+          members: botChannelOf(g2)?.members?.size ?? 0,
+          autoRejoin: gs(g2.id).autoRejoin,
+          voiceChat: Boolean(gs(g2.id).voiceChat),
+        })),
         voiceMembers: (() => {
           const ch = inChannelId ? guild?.channels?.cache?.get(inChannelId) : null;
           return ch ? [...ch.members.values()].map((mm) => mm.displayName) : [];
@@ -405,12 +436,23 @@ if (SELF_URL && String(process.env.SELF_PING || 'true').toLowerCase() !== 'false
 // ---------------------------------------------------------------------------
 // منطق الصوت
 // ---------------------------------------------------------------------------
-function scheduleJoin(delayMs = 5000) {
-  if (joinTimer) clearTimeout(joinTimer);
-  joinTimer = setTimeout(() => {
-    joinTimer = null;
-    ensureConnected().catch((e) => log('خطأ في إعادة الدخول:', e.message));
-  }, delayMs);
+let joinTimer = null; // مؤقت إعادة الدخول (للمسار العام بدون سيرفر محدد)
+
+function scheduleJoin(delayMs = 5000, guildId = '') {
+  const key = String(guildId || '');
+  const st = key ? gs(key) : null;
+  const run = () => {
+    if (st) st.joinTimer = null;
+    else joinTimer = null;
+    ensureConnected(key || undefined).catch((e) => log('خطأ في إعادة الدخول:', e.message));
+  };
+  if (st) {
+    if (st.joinTimer) clearTimeout(st.joinTimer);
+    st.joinTimer = setTimeout(run, delayMs);
+  } else {
+    if (joinTimer) clearTimeout(joinTimer);
+    joinTimer = setTimeout(run, delayMs);
+  }
 }
 
 function isConnectedTo(conn, channelId) {
@@ -422,43 +464,112 @@ function isConnectedTo(conn, channelId) {
   return okState && conn.joinConfig.channelId === channelId;
 }
 
-async function ensureConnected() {
-  if (!autoRejoin) return;
-  if (!VOICE_CHANNEL_ID) return;
+/** الرومات الصوتية المحددة في الإعدادات (تقبل أكثر من روم مفصولة بفاصلة) */
+function configuredChannelIds() {
+  const raw = [process.env.VOICE_CHANNEL_ID, process.env.VOICE_CHANNEL_IDS]
+    .filter(Boolean)
+    .join(',');
+  return [
+    ...new Set(
+      raw
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter((s) => /^\d{5,}$/.test(s)),
+    ),
+  ];
+}
 
-  let channel;
+function isVoiceType(ch) {
+  return Boolean(ch) && (ch.type === ChannelType.GuildVoice || ch.type === ChannelType.GuildStageVoice);
+}
+
+/** أول روم صوتي ممكن ندخله في السيرفر (لما ما فيه روم محدد بالإعدادات) */
+function pickVoiceChannel(guild) {
   try {
-    channel = await client.channels.fetch(VOICE_CHANNEL_ID);
+    const me = guild.members.me;
+    const list = [...guild.channels.cache.values()].filter(
+      (c) => c && c.type === ChannelType.GuildVoice && c.id !== guild.afkChannelId,
+    );
+    const withPeople = list.find((c) => c.members.size > 0);
+    if (withPeople) return withPeople;
+    const joinable = list.filter((c) => {
+      const perms = me ? c.permissionsFor(me) : null;
+      const canJoin = !perms || perms.has(PermissionFlagsBits.Connect);
+      return canJoin && (c.userLimit === 0 || c.members.size < c.userLimit);
+    });
+    return joinable[0] || list[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+/** الروم الصوتي المطلوب لسيرفر معيّن */
+async function targetChannelFor(guildId) {
+  const st = gs(guildId);
+
+  // 1) آخر روم قعد فيه (يتحدد من /join أو من دخول تلقائي سابق)
+  if (st.channelId) {
+    const cached = client.channels.cache.get(st.channelId);
+    if (cached && cached.guildId === guildId && isVoiceType(cached)) return cached;
+    const fetched = await client.channels.fetch(st.channelId).catch(() => null);
+    if (fetched && fetched.guildId === guildId && isVoiceType(fetched)) return fetched;
+  }
+
+  // 2) الرومات المحددة في الإعدادات
+  for (const id of configuredChannelIds()) {
+    const ch =
+      client.channels.cache.get(id) || (await client.channels.fetch(id).catch(() => null));
+    if (ch && ch.guildId === guildId && isVoiceType(ch)) return ch;
+  }
+
+  // 3) أول روم صوتي متاح بالسيرفر
+  const guild = client.guilds.cache.get(guildId);
+  return guild ? pickVoiceChannel(guild) : null;
+}
+
+/** يتأكد أن البوت داخل الروم الصوتي — لسيرفر واحد أو لكل السيرفرات */
+async function ensureConnected(guildId) {
+  if (!guildId) {
+    for (const g of client.guilds.cache.values()) {
+      await ensureConnected(g.id).catch(() => {});
+    }
+    return;
+  }
+
+  const st = gs(guildId);
+  if (!st.autoRejoin) return;
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  let channel = null;
+  try {
+    channel = await targetChannelFor(guildId);
   } catch (err) {
     log('ما قدرت أجيب الروم الصوتي:', err.message);
     return;
   }
 
-  if (!channel || !channel.guild) {
-    log('الروم الصوتي غير موجود (يمكن البوت مو داخل السيرفر).');
+  if (!channel) {
+    if (!st.warnedNoChannel) {
+      st.warnedNoChannel = true;
+      log(`ما فيه روم صوتي في «${guild.name}» — ادخل روم بصوتك واكتب /join.`);
+    }
     return;
   }
+  st.channelId = channel.id;
 
-  if (
-    channel.type !== ChannelType.GuildVoice &&
-    channel.type !== ChannelType.GuildStageVoice
-  ) {
-    log('تنبيه: المعرف المحدد ليس رومًا صوتيًا.');
-    return;
-  }
-
-  const guild = channel.guild;
   const conn = getVoiceConnection(guild.id);
 
   // مصدر الحقيقة: رأي ديسكورد نفسه عن مكان البوت
-  const meChannelId = guild.members.me?.voice?.channelId ?? null;
+  const meChannelId = botChannelOf(guild)?.id ?? null;
   const ready = Boolean(conn) && conn.state.status === VoiceConnectionStatus.Ready;
 
   // متصل فعلاً بالروم الصحيح -> ما نسوي شي
   if (ready && meChannelId === channel.id) return;
 
   // لسا داخل مهلة محاولة حديثة -> ننتظرها
-  if (Date.now() - lastJoinAt < JOIN_GRACE_MS) return;
+  if (Date.now() - st.lastJoinAt < JOIN_GRACE_MS) return;
 
   log(
     `⚠️ الاتصال غير سليم (state=${conn ? conn.state.status : 'لا يوجد'}, ` +
@@ -473,19 +584,22 @@ async function ensureConnected() {
     }
   }
 
-  lastJoinAt = Date.now();
+  st.lastJoinAt = Date.now();
   connect(guild, channel);
 }
 
 function connect(guild, channel) {
-  lastJoinAt = Date.now();
+  const st = gs(guild.id);
+  st.lastJoinAt = Date.now();
+  st.channelId = channel.id;
+  st.warnedNoChannel = false;
   let conn;
   try {
     // مصدر واحد للاتصال — نفس الإعدادات (selfMute/selfDeaf/تصحيح الصوت)
     conn = music.getOrCreateConnection(guild, channel).conn;
   } catch (err) {
     log('فشل الاتصال الصوتي:', err.message);
-    scheduleJoin(5000);
+    scheduleJoin(5000, guild.id);
     return;
   }
 
@@ -493,7 +607,7 @@ function connect(guild, channel) {
   conn.on(VoiceConnectionStatus.Ready, () => {
     // نمنع تكرار الرسالة (بروتوكول DAVE يعيد التفاوض أكثر من مرة)
     if (Date.now() - lastReadyLog > 10000) {
-      log(`✅ دخلت الروم الصوتي: ${channel.name}`);
+      log(`✅ دخلت الروم الصوتي: ${channel.name} — سيرفر «${guild.name}»`);
       lastReadyLog = Date.now();
     }
     // نربط مشغّل الموسيقى بالاتصال عشان يشتغل الصوت
@@ -505,10 +619,10 @@ function connect(guild, channel) {
 
     // نفعّل السماع للمحادثة الصوتية
     try {
-      if (voiceChat) voiceChat.stop();
+      if (st.voiceChat) st.voiceChat.stop();
       // معالجة كلام المستخدم — نستدعيها من الطابور تحت (واحد في كل مرة)
       const handleVoice = async (u) => {
-        voiceBusy = true;
+        st.busy = true;
         const t0 = Date.now();
         try {
           const said = await speech.transcribe(u.packets, { language: 'ar' });
@@ -522,7 +636,7 @@ function connect(guild, channel) {
           if (!text) return;
 
           // لو المقطع جاء وقت البوت يتكلم وكان نفسه كلام البوت = صدى صوتنا، نتجاهله
-          if (u.duringSpeech && looksLikeEcho(text, lastSpokenText)) {
+          if (u.duringSpeech && looksLikeEcho(text, st.lastSpoken)) {
             log(`🔁 تجاهلت صدى صوتي: "${text.slice(0, 60)}"`);
             return;
           }
@@ -547,7 +661,7 @@ function connect(guild, channel) {
           if (intent) {
             const wasOn = voiceChatOn;
             setVoiceChat(intent === 'on', `بالكلام من ${name}`);
-            voiceChat.setSpeaking(true);
+            st.voiceChat?.setSpeaking(true);
             try {
               if (wasOn !== voiceChatOn || intent === 'on') {
                 await speakLine(
@@ -560,7 +674,7 @@ function connect(guild, channel) {
             } catch (e) {
               log('⚠️ ما قدرت أأكد الأمر بالصوت:', String(e.message).slice(0, 120));
             } finally {
-              voiceChat.setSpeaking(false);
+              st.voiceChat?.setSpeaking(false);
             }
             return;
           }
@@ -594,13 +708,13 @@ function connect(guild, channel) {
           }
           if (vcmd) {
             log(`🎛️ أمر صوتي: "${text}"`);
-            voiceChat.setSpeaking(true);
+            st.voiceChat?.setSpeaking(true);
             try {
               if (vcmd.say) await speakLine(guild, forSpeech(vcmd.say));
             } catch (e) {
               log('⚠️ ما قدرت أنطق التأكيد:', String(e.message).slice(0, 120));
             } finally {
-              voiceChat.setSpeaking(false);
+              st.voiceChat?.setSpeaking(false);
             }
             if (typeof vcmd.after === 'function') {
               try {
@@ -612,7 +726,7 @@ function connect(guild, channel) {
             return;
           }
 
-          voiceChat.setSpeaking(true);
+          st.voiceChat?.setSpeaking(true);
 
           const reply = await chat.voiceReply({ key: `voice:${u.userId}`, text, userLabel: name });
           log(`💬 رد (${Date.now() - t0}ms${reply.model ? `، ${reply.model}` : ''}): "${reply.text}"`);
@@ -627,40 +741,40 @@ function connect(guild, channel) {
             /* ignore */
           }
           const stream = await speech.speak(reply.text);
-          lastSpokenText = reply.text;
+          st.lastSpoken = reply.text;
           const played = await m.speak(stream, 1);
           log(`🔊 نطقنا (${Date.now() - t0}ms) — تشغيل=${played ? 'نجح' : 'ما وصل'}`);
         } catch (e) {
           log('⚠️ فشل الرد الصوتي:', String(e.message).slice(0, 150));
         } finally {
-          voiceChat.setSpeaking(false);
-          voiceBusy = false;
+          st.voiceChat?.setSpeaking(false);
+          st.busy = false;
         }
       };
 
-      voiceChat = new VoiceChat(conn, {
+      st.voiceChat = new VoiceChat(conn, {
         onUtterance: async (u) => {
-          if (voiceBusy) {
+          if (st.busy) {
             // البوت مشغول — نحفظ كلامك عشان نرد عليه بعد ما نخلص (بدل ما نرميه)
             // ولو وصل مقطع ثاني بسرعة ندمجهم: كثير ينسحب كلام المتحدث والبوت يتكلم
             // (نص الجملة قبل ونصها بعد) فدمجهم يعطينا جملة مفهومة.
             const now = Date.now();
             if (
-              pendingVoice &&
-              pendingVoice.userId === u.userId &&
-              now - pendingVoice.at < 4000
+              st.pending &&
+              st.pending.userId === u.userId &&
+              now - st.pending.at < 4000
             ) {
               // نضيف صمت قصير بينهم عشان الكلام ما يتلاصق
               const gap = Array.from({ length: 8 }, () => Buffer.from([0xf8, 0xff, 0xfe]));
-              pendingVoice = {
-                ...pendingVoice,
-                packets: pendingVoice.packets.concat(gap, u.packets),
-                count: (pendingVoice.count || 0) + (u.count || 0),
+              st.pending = {
+                ...st.pending,
+                packets: st.pending.packets.concat(gap, u.packets),
+                count: (st.pending.count || 0) + (u.count || 0),
                 at: now,
               };
-              log(`⏳ البوت مشغول — دمجت مقاطعك (${pendingVoice.packets.length} حزمة)`);
+              log(`⏳ البوت مشغول — دمجت مقاطعك (${st.pending.packets.length} حزمة)`);
             } else {
-              pendingVoice = { ...u, at: now };
+              st.pending = { ...u, at: now };
               log('⏳ البوت مشغول — بحفظ كلامك وأرد عليه بعد ما أخلص ردي');
             }
             return;
@@ -668,16 +782,16 @@ function connect(guild, channel) {
           await handleVoice(u);
           // نعالج آخر كلام وصل أثناء الرد
           let guard = 0;
-          while (pendingVoice && guard++ < 4) {
-            const next = pendingVoice;
-            pendingVoice = null;
+          while (st.pending && guard++ < 4) {
+            const next = st.pending;
+            st.pending = null;
             await handleVoice(next);
           }
-          pendingVoice = null;
+          st.pending = null;
         },
       });
-      voiceChat.setEnabled(voiceChatOn);
-      voiceChat.start();
+      st.voiceChat.setEnabled(voiceChatOn);
+      st.voiceChat.start();
     } catch (e) {
       log('تنبيه: تعذّر تشغيل المحادثة الصوتية:', e.message);
     }
@@ -701,17 +815,17 @@ function connect(guild, channel) {
       } catch {
         /* ignore */
       }
-      lastJoinAt = 0;
-      scheduleJoin(800);
+      st.lastJoinAt = 0;
+      scheduleJoin(800, guild.id);
     }
   });
 
   // شبكة أمان: لو صار الاتصال Destroyed لأي سبب بدون حدث disconnect
   conn.on('stateChange', (oldS, newS) => {
-    if (newS.status === VoiceConnectionStatus.Destroyed && autoRejoin && VOICE_CHANNEL_ID) {
+    if (newS.status === VoiceConnectionStatus.Destroyed && st.autoRejoin && st.channelId) {
       log(`♻️ الاتصال انتهى (${oldS.status} → destroyed) — أعيد الدخول.`);
-      lastJoinAt = 0;
-      scheduleJoin(1200);
+      st.lastJoinAt = 0;
+      scheduleJoin(1200, guild.id);
     }
   });
 
@@ -728,7 +842,7 @@ async function greetTest(guild, who = '') {
     // ننتظر لين تشفير E2EE يجهز (وإلا الصوت ينرسل بدون تشفير ويسكت عند المستمع)
     const daveOk = await music.waitForDaveReady(conn, 6000);
     log(`🎧 التشفير (DAVE) عند الترحيب: ${daveOk ? 'جاهز' : 'غير جاهز'}`);
-    if (voiceChat) voiceChat.setSpeaking(true);
+    st.voiceChat?.setSpeaking(true);
     const m = music.getQueue(guild.id);
     const line = `يا هلا ${who}! أنا أسمعك وأرد عليك، تكلّم طبيعي.`;
     const ogg = await speech.speak(line);
@@ -738,7 +852,7 @@ async function greetTest(guild, who = '') {
     log('⚠️ النطق فشل:', String(e.message).slice(0, 160));
     throw e;
   } finally {
-    if (voiceChat) voiceChat.setSpeaking(false);
+    st.voiceChat?.setSpeaking(false);
   }
 }
 
@@ -784,7 +898,7 @@ client.once('ready', async () => {
       } else {
         out.push('- انت مو داخل أي روم صوتي حالياً');
       }
-      if (voiceChat) {
+      if (g && gs(g.id).voiceChat) {
         out.push(`- السوالف الصوتية: ${voiceChatOn ? 'مشغّلة (تسمع وترد بالصوت)' : 'موقفة (تشتغل بأمر صوتي)'}`);
       }
       const q = g ? music.getQueue(g.id) : null;
@@ -817,10 +931,13 @@ client.once('ready', async () => {
     .warmTtsCache()
     .catch((e) => log('⚠️ تسخين النطق فشل:', String(e.message).slice(0, 140)));
 
-  if (VOICE_CHANNEL_ID) {
+  // ندخل الروم الصوتي في كل سيرفر (المحدد بالإعدادات أو أول روم صوتي متاح)
+  const AUTO_JOIN_ALL =
+    String(process.env.AUTO_JOIN_ALL || 'true').toLowerCase() !== 'false';
+  if (AUTO_JOIN_ALL || configuredChannelIds().length) {
     await ensureConnected();
   } else {
-    log('VOICE_CHANNEL_ID غير محدد — البوت ما بيدخل روم تلقائيًا.');
+    log('ما فيه روم محدد بالإعدادات ودخول باقي السيرفرات متوقف.');
   }
 
   // رتبة البوت في كل سيرفر 🎖️
@@ -832,11 +949,17 @@ client.once('ready', async () => {
 client.on('guildCreate', (guild) => {
   log(`انضممت لسيرفر جديد: ${guild.name}`);
   ensureBotRole(guild).catch(() => {});
+  // نسجّل الأوامر في السيرفر الجديد فوراً، وندخل روم صوتي لو الدخول التلقائي مفعّل
+  registerCommands().catch(() => {});
+  if (String(process.env.AUTO_JOIN_ALL || 'true').toLowerCase() !== 'false') {
+    setTimeout(() => ensureConnected(guild.id).catch(() => {}), 4000);
+  }
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
   if (!client.user || newState.id !== client.user.id) return;
-  if (!autoRejoin) return;
+  const vState = gs(newState.guild?.id);
+  if (!vState.autoRejoin) return;
 
   // أحد صمّم/كتم البوت على السيرفر -> نحاول نلغيها فوراً (تحتاج صلاحية Deafen Members)
   if (newState.deaf || newState.mute) {
@@ -870,8 +993,8 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   // طلع من الروم (انفصل / طردوه)
   if (oldState.channelId && !newState.channelId) {
     log('⚠️ طلعت من الروم الصوتي — أحاول أرجع.');
-    lastJoinAt = 0; // نسمح بإعادة الدخول فوراً
-    scheduleJoin(3000);
+    vState.lastJoinAt = 0; // نسمح بإعادة الدخول فوراً
+    scheduleJoin(3000, newState.guild?.id);
     return;
   }
 
@@ -883,8 +1006,8 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   ) {
     log(`نقلوني إلى روم ثاني: ${newState.channel?.name ?? newState.channelId}`);
     if (LOCK_TO_CHANNEL) {
-      lastJoinAt = 0; // نسمح بإعادة الدخول فوراً
-      scheduleJoin(3000);
+      vState.lastJoinAt = 0; // نسمح بإعادة الدخول فوراً
+      scheduleJoin(3000, newState.guild?.id);
     }
   }
 });
@@ -897,15 +1020,16 @@ const PLAY_INTENT =
 const STOP_INTENT = /^\s*(?:وقف|أوقف|اوقف|اقفل|سكّر|سكر|اسكت|خلص|stop)\s*[!.؟]*$/i;
 const SKIP_INTENT = /^\s*(?:تخطى|تخطي|سكب|التالي|اللي بعدها|skip|next)\s*[!.؟]*$/i;
 
-/** يجيب الروم الصوتي: روم المستخدم أو الروم المحدد في الإعدادات */
+/** يجيب الروم الصوتي: روم المستخدم أو الروم المخصص للسيرفر */
 async function resolveVoiceChannel(message) {
   const own = message.member?.voice?.channel;
   if (own) return own;
-  if (!message.guild || !VOICE_CHANNEL_ID) return null;
-  return (
-    message.guild.channels.cache.get(VOICE_CHANNEL_ID) ||
-    (await message.guild.channels.fetch(VOICE_CHANNEL_ID).catch(() => null))
-  );
+  if (!message.guild) return null;
+  try {
+    return await targetChannelFor(message.guild.id);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1099,12 +1223,13 @@ function voiceToggleIntent(raw, playing = false) {
   return null;
 }
 
-/** يشغّل/يوقف الرد الصوتي فعلياً */
+/** يشغّل/يوقف الرد الصوتي فعلياً (يطبّق على كل السيرفرات) */
 function setVoiceChat(on, by = '') {
   voiceChatOn = Boolean(on);
-  if (voiceChat) {
+  for (const s of guildState.values()) {
+    if (!s.voiceChat) continue;
     try {
-      voiceChat.setEnabled(voiceChatOn);
+      s.voiceChat.setEnabled(voiceChatOn);
     } catch {
       /* ignore */
     }
@@ -1115,7 +1240,7 @@ function setVoiceChat(on, by = '') {
 
 /** ينطق جملة قصيرة (تأكيد أمر صوتي) */
 async function speakLine(guild, line) {
-  lastSpokenText = line;
+  gs(guild.id).lastSpoken = line;
   const m = music.getQueue(guild.id);
   const ogg = await speech.speak(line);
   return m.speak(ogg, 1);
@@ -1409,7 +1534,7 @@ async function runVoiceCommand(guild, rawText) {
   // ---- اطلع من الروم ----
   if (V_LEAVE_RE.test(n)) {
     const chName = forSpeech(botVoiceChannel(guild)?.name || 'الروم');
-    autoRejoin = false;
+    gs(guild.id).autoRejoin = false;
     try {
       m0?.stopAll();
     } catch {
@@ -1419,7 +1544,7 @@ async function runVoiceCommand(guild, rawText) {
       say: `طيب، اطلع من ${chName}. لو تبي أرجع قول: ادخل الروم.`,
       after: async () => {
         await new Promise((r) => setTimeout(r, 2500));
-        autoRejoin = false;
+        gs(guild.id).autoRejoin = false;
         try {
           getVoiceConnection(guild.id)?.destroy();
         } catch {
@@ -1431,7 +1556,7 @@ async function runVoiceCommand(guild, rawText) {
 
   // ---- ارجع للروم ----
   if (V_JOIN_RE.test(n)) {
-    autoRejoin = true;
+    gs(guild.id).autoRejoin = true;
     const conn = getVoiceConnection(guild.id);
     if (conn && conn.state.status === VoiceConnectionStatus.Ready) {
       return { say: 'أنا معك في الروم، تفضل.' };
@@ -1674,25 +1799,30 @@ async function registerCommands() {
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
 
   try {
-    if (GUILD_ID) {
-      await client.rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), {
-        body: commands,
-      });
-      log(`تم تسجيل الأوامر في السيرفر ${GUILD_ID}.`);
-
-      // نمسح أي أوامر عامة قديمة متروكة (مثل /music) عشان ما تلخبط المستخدم
+    // 1) نسجّل الأوامر في كل سيرفر البوت فيه (تظهر فوراً)
+    const guildIds = [
+      ...new Set([
+        ...client.guilds.cache.keys(),
+        ...(GUILD_ID ? GUILD_ID.split(/[,\s]+/).filter(Boolean) : []),
+      ]),
+    ];
+    for (const gid of guildIds) {
       try {
-        const existing = await client.rest.get(Routes.applicationCommands(client.user.id));
-        if (Array.isArray(existing) && existing.length) {
-          await client.rest.put(Routes.applicationCommands(client.user.id), { body: [] });
-          log(`تم مسح ${existing.length} أمر عام قديم (${existing.map((c) => '/' + c.name).join(', ')}).`);
-        }
+        await client.rest.put(Routes.applicationGuildCommands(client.user.id, gid), {
+          body: commands,
+        });
+        log(`تم تسجيل الأوامر في السيرفر ${gid}.`);
       } catch (e) {
-        log('تنبيه: ما قدرت أمسح الأوامر العامة:', e.message);
+        log(`تنبيه: ما قدرت أسجّل الأوامر في ${gid}: ${String(e.message).slice(0, 90)}`);
       }
-    } else {
+    }
+
+    // 2) نسجّل نسخة عامة كمان (تظهر بأي سيرفر جديد ينضم له البوت لاحقاً)
+    try {
       await client.rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-      log('تم تسجيل الأوامر عالميًا (قد تأخذ وقت لتظهر).');
+      log('تم تسجيل الأوامر عالميًا (تظهر بأي سيرفر جديد).');
+    } catch (e) {
+      log('تنبيه: ما قدرت أسجّل الأوامر العامة:', String(e.message).slice(0, 90));
     }
   } catch (err) {
     log('ما قدرت أسجّل أوامر السلاش:', err.message);
@@ -1716,18 +1846,29 @@ client.on('interactionCreate', async (interaction) => {
     if (chatHandled) return;
 
     if (interaction.commandName === 'join') {
-      autoRejoin = true;
       await interaction.deferReply();
-      let channel = null;
-      if (VOICE_CHANNEL_ID) {
-        channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
+      const gid = interaction.guild?.id;
+      if (gid) gs(gid).autoRejoin = true;
+
+      // نفضّل روم المتصل نفسه (لو هو داخل روم صوتي في نفس السيرفر)
+      let channel = interaction.member?.voice?.channel ?? null;
+
+      // وإلا الروم المخصص لهذا السيرفر (من الإعدادات أو آخر روم دخلناه)
+      if (!channel && gid) channel = await targetChannelFor(gid).catch(() => null);
+
+      if (!channel && VOICE_CHANNEL_ID && interaction.guildId) {
+        const ch = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
+        if (ch && ch.guildId === interaction.guildId) channel = ch;
       }
-      if (!channel) channel = interaction.member?.voice?.channel ?? null;
       if (!channel) {
-        await interaction.editReply('لازم تحدد روم صوتي في الإعدادات أو تدخل روم بصوتك.');
+        await interaction.editReply(
+          'ما لقيت روم صوتي. ادخل روم صوتي بنفسك واكتب /join أو حدد روم بالإعدادات.',
+        );
         return;
       }
       const guild = channel.guild;
+      gs(guild.id).autoRejoin = true;
+      gs(guild.id).channelId = channel.id;
       const conn = getVoiceConnection(guild.id);
       if (conn) conn.destroy();
       connect(guild, channel);
@@ -1736,7 +1877,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'leave') {
-      autoRejoin = false;
+      if (interaction.guild) gs(interaction.guild.id).autoRejoin = false;
       // نوقف الموسيقى أيضاً
       if (interaction.guild && music.hasQueue(interaction.guild.id)) {
         try {
@@ -1770,13 +1911,15 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'status') {
-      const conn = interaction.guild ? getVoiceConnection(interaction.guild.id) : null;
+      const gid = interaction.guild?.id;
+      const conn = gid ? getVoiceConnection(gid) : null;
+      const st = gid ? gs(gid) : null;
       if (conn && conn.state.status === VoiceConnectionStatus.Ready) {
         await interaction.reply(
           `داخل الروم 🟢\n` +
             `اسم الروم: **${interaction.guild.channels.cache.get(conn.joinConfig.channelId)?.name ?? 'غير معروف'}**\n` +
             `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
-            `الرجوع التلقائي: ${autoRejoin ? 'مفعّل' : 'متوقف'}\n` +
+            `الرجوع التلقائي: ${st?.autoRejoin ? 'مفعّل' : 'متوقف'}\n` +
             `الرد الصوتي: ${voiceChatOn ? 'مفعّل ✅' : 'متوقف ⛔'}\n` +
             `السوالف: ${CHAT_ENABLED ? 'مفعّل' : 'متوقف'}\n` +
             `ذكاء اصطناعي: ${

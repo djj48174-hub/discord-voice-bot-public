@@ -452,9 +452,9 @@ function oggToWav(ogg) {
         'ogg',
         '-i',
         'pipe:0',
-        // ننظّف الصوت (تنقية ضجيج + رفع الصوت الواطي) ونقيس مستواه قبل الرفع
+        // ننظّف الصوت (تنقية ضجيج + رفع الصوت الواطي) ونقيس مستواه الأصلي أولاً
         '-af',
-        'highpass=f=80,afftdn=nf=-25,volumedetect,dynaudnorm=f=200:g=15:p=0.95,volume=3dB',
+        'volumedetect,highpass=f=80,afftdn=nf=-25,dynaudnorm=f=200:g=15:p=0.95,volume=3dB,alimiter=limit=0.95',
         '-ar',
         '16000',
         '-ac',
@@ -491,6 +491,36 @@ function oggToWav(ogg) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// تشخيص: نحفظ آخر المقاطع المسموعة (نقدر نسمع صوت المتحدث الحقيقي)
+// ---------------------------------------------------------------------------
+const CAPTURE_KEEP = Math.max(0, Number(process.env.CAPTURE_KEEP || 3));
+const captures = [];
+
+function rememberCapture(rec) {
+  if (!CAPTURE_KEEP) return null;
+  captures.push(rec);
+  while (captures.length > CAPTURE_KEEP) captures.shift();
+  return rec;
+}
+
+/** آخر المقاطع (وأحياناً الصوت نفسه base64) للتشخيص */
+function captureDebug(withAudio = false) {
+  return captures.map((c) => ({
+    at: c.at,
+    seconds: c.seconds,
+    level: c.level,
+    rate: c.rate,
+    packets: c.packets,
+    text: c.text ?? null,
+    raw: c.raw ?? null,
+    quiet: c.quiet ?? false,
+    junk: c.junk ?? false,
+    conf: c.conf || null,
+    audioWavB64: withAudio && c.wav ? c.wav.toString('base64') : undefined,
+  }));
+}
+
 /**
  * يفرّغ حزم Opus خام إلى نص.
  * @param {Buffer[]} opusPackets حزم Opus من ديسكورد
@@ -503,19 +533,38 @@ async function transcribe(opusPackets, opts = {}) {
 
   const ogg = muxOggOpus(list, { channels: 2, sampleRate: 48000 });
   const { wav, level } = await oggToWav(ogg);
+  const seconds = (list.length * 20) / 1000; // كل حزمة Opus ≈ 20ms
+
+  // نحفظ المقطع للتشخيص (نسمع صوت المتحدث الحقيقي عند الحاجة)
+  const rec = rememberCapture({
+    at: Date.now(),
+    seconds,
+    level,
+    wav: wav.length < 400000 ? wav : null,
+    packets: list.length,
+    rate: Math.round(
+      list.reduce((a, p) => a + p.length, 0) / Math.max(1, list.length),
+    ),
+  });
+  const done = (o) => {
+    if (rec) Object.assign(rec, o);
+    return o;
+  };
+  log(
+    `🎚️ مقطع (${seconds.toFixed(1)} ثانية | ${rec ? rec.rate : '?'} بايت/حزمة) مستوى: أعلى ${level.max}dB / متوسط ${level.mean}dB`,
+  );
 
   // فلتر مهم: الصمت والضجيج = هلوسة. نتجاهل المقطع قبل ما نرسله أصلاً
   // ملاحظة: dynaudnorm يرفع الصوت الواطي بعد هذي القياسة، فنقبل الأوطأ هنا
   //         (وفحص ثقة Whisper no_speech_prob هو خط الدفاع الثاني).
   const softDb = Number(process.env.STT_MIN_DB || -45);
   const hardDb = Number(process.env.STT_HARD_DB || -55);
-  const seconds = (list.length * 20) / 1000; // كل حزمة Opus ≈ 20ms
   const maxDb = level.max;
   if (maxDb != null && (maxDb <= hardDb || (maxDb <= softDb && seconds > 6))) {
     log(
       `🔇 صوت واطي/صمت (أعلى مستوى ${maxDb}dB، ${seconds.toFixed(1)} ثانية) — تجاهلته قبل التفريغ`,
     );
-    return { text: '', quiet: true, level };
+    return done({ text: '', quiet: true, level });
   }
 
   const form = new FormData();
@@ -577,24 +626,24 @@ async function transcribe(opusPackets, opts = {}) {
 
     if (noSpeech > noSpeechMax) {
       log(`🙈 تجاهلت مقطع (يغلب أنه صمت/ضجيج: ${noSpeech.toFixed(2)})، النص كان: "${text.slice(0, 50)}"`);
-      return { text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } };
+      return done({ text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } });
     }
     if (comp > compMax) {
       log(`🙈 تجاهلت مقطع (تكرار/هلوسة: ${comp.toFixed(2)})، النص: "${text.slice(0, 50)}"`);
-      return { text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } };
+      return done({ text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } });
     }
     if (avgLog < logMin) {
       log(`🙈 تجاهلت مقطع (ثقة واطية: ${avgLog.toFixed(2)})، النص: "${text.slice(0, 50)}"`);
-      return { text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } };
+      return done({ text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } });
     }
   }
 
   // نرفض الهلوسة (نصوص اخترعها الموديل على صوت مو كلام)
   if (!text || isJunkTranscript(text)) {
     log(`🚫 تفريغ مرفوض (هلوسة/فاضي): "${text.slice(0, 70)}"`);
-    return { text: '', junk: true, raw: text, level };
+    return done({ text: '', junk: true, raw: text, level });
   }
-  return { text, language: data?.language, level };
+  return done({ text, language: data?.language, level });
 }
 
 // ---------------------------------------------------------------------------
@@ -671,5 +720,6 @@ module.exports = {
   // للفحص (test-voicecmd.js)
   isJunkTranscript,
   sttNorm,
+  captureDebug,
   STT_MODEL,
 };

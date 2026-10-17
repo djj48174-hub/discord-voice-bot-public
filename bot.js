@@ -130,6 +130,7 @@ const healthServer = http.createServer(async (req, res) => {
               daveReady: dave?.session?.ready ?? false,
               voiceChat: voiceChat ? voiceChat.stats : null,
               voiceDebug: music.getVoiceDebug(50),
+              captures: speech.captureDebug(u.searchParams.get('audio') === '1'),
             },
             null,
             2,

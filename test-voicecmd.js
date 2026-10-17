@@ -6,6 +6,7 @@
 
 const { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho } = require('./bot');
 const { isJunkTranscript } = require('./speech');
+const { scoreMatch, normTitle } = require('./music');
 
 const guild = {
   id: 'test-guild-0',
@@ -59,6 +60,24 @@ async function main() {
   ok(looksLikeEcho('حاضر أشغلها لك', 'طيب، حاضر أشغلها لك') === true, 'نفس كلام البوت = صدى');
   ok(looksLikeEcho('هلا وش أخبارك', 'طيب، شغالة الآن أغنية') === false, 'كلام مختلف = مو صدى');
 
+  section('اختيار الأغنية الصحيحة (scoreMatch)');
+  const song = (title, uploader = '', duration = 240) => ({ title, uploader, duration });
+  const s1 = scoreMatch('كاظم الساهر مدرسة الحب', song('Kadim Al Saher Fi Madrasat Al Hob كاظم الساهر - في مدرسة الحب'));
+  ok(s1 >= 0.8, `الاسم كامل -> ${s1.toFixed(2)}`);
+  const s2 = scoreMatch('محمد عبده', song('الاماكن - محمد عبده'));
+  ok(s2 >= 0.6, `فنان فقط -> ${s2.toFixed(2)}`);
+  const s3 = scoreMatch('Love on the Catwalk', song('Her Words Kill - Love On The Catwalk'));
+  ok(s3 >= 0.8, `إنجليزي -> ${s3.toFixed(2)}`);
+  const s4 = scoreMatch('راشد الماجد', song('أغنية رعب بدون علاقة'));
+  ok(s4 < 0.45, `نتيجة عشوائية -> ${s4.toFixed(2)}`);
+  const s5 = scoreMatch('asdkjhasd qweqwe', song('أغنية حلوة'));
+  ok(s5 < 0.45, `كلام فاضي -> ${s5.toFixed(2)}`);
+  const s6 = scoreMatch('رابح صقر شاريك', song('رابح صقر - شاريك (حصرياً) 2019'));
+  ok(s6 >= 0.8, `اسم + أغنية -> ${s6.toFixed(2)}`);
+  const s7 = scoreMatch('محمد عبده', song('محمد عبده - الاماكن (ريمكس slowed)'));
+  ok(s7 < s2, `الريمكس أقل من الأصلي (${s7.toFixed(2)} < ${s2.toFixed(2)})`);
+  ok(normTitle('شغّل  الأغنية') === 'شغل الاغنيه', 'تنظيف الهمزات والتشكيل', normTitle('شغّل  الأغنية'));
+
   section('أوامر الروم بالصوت (runVoiceCommand)');
   const cases = [
     ['اطلع من الروم', (r) => r && /اطلع من/.test(r.say)],
@@ -73,6 +92,9 @@ async function main() {
     ['شغل لي أغنية', (r) => r && /وش الأغنية/.test(r.say)],
     ['طيب شغل لي كاظم الساهر', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
     ['ادخل الروم', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
+    ['لا مو هذي', (r) => r && /ما عندي بدائل/.test(r.say)],
+    ['مو هذي', (r) => r && /ما عندي بدائل/.test(r.say)],
+    ['غيرها', (r) => r && /ما عندي بدائل/.test(r.say)],
     ['كوميك', (r) => r === null],
   ];
 

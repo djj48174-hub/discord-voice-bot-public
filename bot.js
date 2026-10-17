@@ -810,6 +810,9 @@ async function runMusicFromChat(message, text) {
     resolved = await music.resolveQuery(query);
   } catch (e) {
     log(`ما لقيت "${query}": ${e.message}`);
+    if (e.closest) {
+      return `❓ ما لقيت مطابقة واضحة لـ \`${query}\`.\nأقرب شي: **${e.closest}** — تبي أشغّلها؟ اكتب \`/play ${e.closest.replace(/[`\n]/g, ' ').slice(0, 80)}\``;
+    }
     return `❌ ما لقيت \`${query}\` — جرّب تكتب اسمها بشكل أوضح.`;
   }
 
@@ -1011,6 +1014,9 @@ const V_STOP_RE =
 const V_STOP_WEAK_RE = /^(?:بس|خلاص|اسكت|سكت|تكفي)$/;
 const V_SKIP_RE =
   /^(?:تخطي|تخطى|سكب|التالي|التاليه|اللي بعدها|غير الاغنيه|غير الموسيقي|بدلها|روح للي بعدها|skip|next)$/;
+// «لا مو هذي» = الأغنية اللي شغّلها غلط -> نشغّل أفضل بديل من نفس البحث
+const V_WRONG_RE =
+  /^(?:لا مو هذي|لا مو هاذي|مو هذي|مو هاذي|مو ذي|مو هي|مو هذاك|مو هذي الاغنيه|لا لا مو هذي|غلط|خطا|مو غلط|هذي مو هي|هذي غلط|جيب غيرها|غيرها|ابي غيرها|ابغى غيرها|شي ثاني|جيب شي ثاني|مو هالاغنيه)$/;
 const V_PAUSE_RE = /^(?:وقفها شوي|وقف الموسيقي شوي|اسكت شوي|بريح|بريك|pause)$/;
 const V_RESUME_RE = /^(?:كمل|كملها|اكمل|واصل|شغلها مره ثانيه|شغل الموسيقي|resume|continue)$/;
 const V_LOOP_RE = /^(?:كرر|كررها|اعد|اعيد|كرر الاغنيه|loop)$/;
@@ -1026,6 +1032,46 @@ const V_PLAY_RE =
 function botVoiceChannel(guild) {
   const byId = VOICE_CHANNEL_ID ? guild.channels.cache.get(VOICE_CHANNEL_ID) : null;
   return byId || guild.members?.me?.voice?.channel || null;
+}
+
+// آخر نتائج بحث (بالأمر الصوتي) — عشان المستخدم يقدر يقول «لا مو هذي» ونشغّل البديل
+const lastSearch = new Map(); // guildId -> { query, ranked, index }
+
+/** يشغّل مرشحاً جاهزاً (نستعمله لما نقول «لا مو هذي») */
+async function playCandidate(guild, cand) {
+  const channel = botVoiceChannel(guild);
+  if (!channel) return { say: 'ما لقيت الروم الصوتي.' };
+
+  let m;
+  try {
+    ({ music: m } = music.getOrCreateConnection(guild, channel));
+  } catch (e) {
+    log('⚠️ ما دخلت الروم للأغنية:', String(e.message).slice(0, 120));
+    return { say: 'ما قدرت أدخل الروم الصوتي.' };
+  }
+
+  const title = forSpeech(cand.title || '');
+  const wasPlaying = Boolean(m.current);
+  if (wasPlaying) {
+    try {
+      m.stopAll();
+    } catch {
+      /* ignore */
+    }
+  }
+  m.songs.push({ ...cand, score: undefined });
+
+  return {
+    say: `طيب، هذي: ${title}.`,
+    after: async () => {
+      try {
+        const ok = await m.startAndWait(60000);
+        if (!ok) log('⚠️ البديل ما اشتغل');
+      } catch (e) {
+        log('⚠️ تشغيل البديل:', String(e.message).slice(0, 140));
+      }
+    },
+  };
 }
 
 /** يشغّل أغنية طلبها المستخدم بالصوت */
@@ -1045,14 +1091,26 @@ async function playByVoice(guild, query) {
 
   // نبدأ البحث، ونطق تأكيد سريع بالتوازي عشان ما يحس المستخدم بصمت طويل
   const search = music.resolveQuery(query).catch((e) => {
-    log(`⚠️ ما لقيت "${query}": ${String(e.message).slice(0, 120)}`);
-    return null;
+    log(`⚠️ ما لقيت "${query}": ${String(e.message).slice(0, 160)}`);
+    return { error: e };
   });
   await speakLine(guild, 'طيب، أشوفها لك الحين.').catch(() => {});
   const resolved = await search;
 
-  if (!resolved || !Array.isArray(resolved.songs) || !resolved.songs.length) {
-    return { say: `ما لقيت ${query}. جرب تقول اسمها أوضح.` };
+  if (!resolved || resolved.error || !Array.isArray(resolved.songs) || !resolved.songs.length) {
+    const closest = resolved && resolved.error ? resolved.error.closest : null;
+    return {
+      say: closest
+        ? `ما لقيت "${query}" بالضبط. أقرب شي لقيت: ${forSpeech(closest)}.`
+        : `ما لقيت ${query}. جرب تقول اسمها أوضح.`,
+    };
+  }
+
+  // نحفظ المرشحين عشان «لا مو هذي» تشغّل اللي بعدها
+  if (Array.isArray(resolved.ranked) && resolved.ranked.length) {
+    lastSearch.set(guild.id, { query, ranked: resolved.ranked, index: 0 });
+  } else {
+    lastSearch.delete(guild.id);
   }
 
   m.songs.push(...resolved.songs);
@@ -1138,6 +1196,22 @@ async function runVoiceCommand(guild, rawText) {
       /* ignore */
     }
     return { say: 'طيب، وقفت الموسيقى.' };
+  }
+
+  // ---- «لا مو هذي» : شغّل بديل من نفس البحث ----
+  if (V_WRONG_RE.test(n)) {
+    const st = lastSearch.get(guild.id);
+    if (!st || !st.ranked || !st.ranked.length) {
+      return { say: 'ما عندي بدائل الحين. قول اسم الأغنية من جديد وأشوف لك غيرها.' };
+    }
+    st.index += 1;
+    if (st.index >= st.ranked.length) {
+      lastSearch.delete(guild.id);
+      return { say: `ما لقيت غيرها. جرب قول اسمها بشكل ثاني.` };
+    }
+    const cand = st.ranked[st.index];
+    log(`🎵 بديل (${st.index + 1}/${st.ranked.length}) لـ "${st.query}": ${cand.title} [${Math.round(cand.score * 100)}%]`);
+    return playCandidate(guild, cand);
   }
 
   // ---- التالية ----

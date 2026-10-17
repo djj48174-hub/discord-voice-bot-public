@@ -329,7 +329,14 @@ async function searchSongs(query, limit = 5) {
     throw new Error('ما قدرت أقرأ نتيجة البحث');
   }
 
-  const entries = (json.entries && json.entries.length ? json.entries : [json]).filter(Boolean);
+  // نفس الحماية: لو ما فيه نتائج حقيقية، yt-dlp يرجّع عنصر عنوانه = كلمة البحث
+  const rawEntries = json.entries && json.entries.length ? json.entries : [];
+  const entries = rawEntries.filter((e) => {
+    if (!e) return false;
+    const url = e.webpage_url || e.original_url || e.url || '';
+    if (/youtube\.com|youtu\.be|soundcloud\.com|snd\.sc/i.test(url)) return true;
+    return /^[\w-]{11}$/.test(String(e.id || ''));
+  });
   return entries.map(mapEntry).filter((s) => s.url);
 }
 
@@ -359,7 +366,12 @@ async function searchSoundCloud(query, limit = 3) {
     throw new Error('ما قدرت أقرأ نتيجة ساوند كلاود');
   }
 
-  const entries = (json.entries && json.entries.length ? json.entries : [json]).filter(Boolean);
+  // ملاحظة مهمة: لو ما فيه نتائج، yt-dlp يرجّع صفحة البحث نفسها (عنوانها = كلمة البحث)
+  // فنتجاهل أي عنصر مو مقطع حقيقي (id مو رقمي أو الرابط صفحة بحث)
+  const raw = json.entries && json.entries.length ? json.entries : [];
+  const entries = raw.filter(
+    (e) => e && /^\d+$/.test(String(e.id || '')) && !/\/search|search\?/i.test(String(e.webpage_url || e.url || '')),
+  );
   return entries
     .map((e) => ({
       id: e.id,
@@ -371,6 +383,126 @@ async function searchSoundCloud(query, limit = 3) {
       source: 'soundcloud',
     }))
     .filter((s) => s.url);
+}
+
+/** تطبيع نص للمقارنة (عربي + إنجليزي) */
+function normTitle(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[\u064B-\u0652\u0670\u0640]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/[ىي]/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// كلمات تدل على نسخة غير أصلية (ننقص نقاطها إلا إذا هي مطلوبة)
+const MUSIC_BAD_WORDS = [
+  'cover',
+  'remix',
+  'slowed',
+  'reverb',
+  'karaoke',
+  'instrumental',
+  'nightcore',
+  'sped',
+  'loop',
+  'ريمكس',
+  'كاريوكي',
+  'مقلد',
+  'توزيع',
+  'ميكس',
+  'نسخه',
+];
+
+/** نسبة تشابه حروف (Dice bigrams) — تساعد لو الاسم مكتوب غلط */
+function charSim(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+  const big = (s) => {
+    const m = new Map();
+    for (let i = 0; i < s.length - 1; i++) {
+      const k = s.slice(i, i + 2);
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+    return m;
+  };
+  const A = big(a);
+  const B = big(b);
+  let inter = 0;
+  for (const [k, v] of A) if (B.has(k)) inter += Math.min(v, B.get(k));
+  const total = [...A.values()].reduce((x, y) => x + y, 0) + [...B.values()].reduce((x, y) => x + y, 0);
+  return total ? (2 * inter) / total : 0;
+}
+
+/**
+ * يقيّم كم نتيجة البحث تطابق كلام المستخدم (0 = ما تشبه، 1+ = مطابقة قوية).
+ * الهدف: ما نشغّل أغنية عشوائية إذا الاسم مو واضح.
+ */
+function scoreMatch(query, song) {
+  const q = normTitle(query);
+  const title = normTitle(song.title);
+  const uploader = normTitle(song.uploader);
+  if (!q || !title) return 0;
+
+  const hay = `${title} ${uploader}`;
+  const hayWords = hay.split(' ');
+  const titleWords = title.split(' ');
+  const qt = q.split(' ').filter((w) => w.length > 1);
+  if (!qt.length) return 0;
+
+  let exact = 0;
+  let partial = 0;
+  let fuzzy = 0;
+  for (const w of qt) {
+    if (titleWords.includes(w) || uploader.split(' ').includes(w)) {
+      exact++;
+    } else if (hay.includes(w)) {
+      partial++;
+    } else {
+      // تشابه حروفي مع أقرب كلمة (نتسامح مع الإملاء الغلط)
+      let best = 0;
+      for (const hw of hayWords) {
+        if (hw.length < 2) continue;
+        const sim = charSim(w, hw);
+        if (sim > best) best = sim;
+      }
+      if (best >= 0.72) fuzzy++;
+      else if (best >= 0.55) fuzzy += 0.5;
+    }
+  }
+
+  let score = (exact + partial * 0.45 + fuzzy * 0.7) / qt.length; // 0..1
+  if (q.length >= 4 && hay.includes(q)) score += 0.35; // الطلب كامل موجود بالنص
+  if (title === q) score += 0.3;
+
+  // عقوبات: عنوان طويل زيادة، أو نسخة (كوف/ريمكس) مو مطلوبة
+  const extraWords = Math.max(0, titleWords.length - qt.length);
+  score -= Math.min(0.15, extraWords * 0.02);
+  const badHits = MUSIC_BAD_WORDS.filter((b) => hay.includes(b) && !q.includes(b)).length;
+  score -= Math.min(0.3, badHits * 0.15);
+
+  // المدة: نفضّل 40 ثانية - 12 دقيقة (نستبعد المقاطع القصيرة جداً والمكسات الطويلة)
+  const d = Number(song.duration) || 0;
+  if (d && (d < 30 || d > 720)) score -= 0.1;
+
+  return Math.max(0, Math.min(1.15, score));
+}
+
+/** يرتّب المرشحين حسب التطابق */
+function rankCandidates(query, songs) {
+  const ranked = songs.map((s) => ({ ...s, score: scoreMatch(query, s) })).sort((a, b) => b.score - a.score);
+  return { ranked, best: ranked[0] || null };
+}
+
+function fmtCandidates(ranked, n = 3) {
+  return ranked
+    .slice(0, n)
+    .map((r) => `"${r.title}" [${Math.round(r.score * 100)}%]`)
+    .join(' | ');
 }
 
 /** يبحث عن نفس الأغنية في ساوند كلاود ويرجّع أول نتيجة */
@@ -412,22 +544,59 @@ async function resolveQuery(query, maxPlaylist = 25) {
   // اسم أغنية -> ساوند كلاود أولاً.
   // السبب: يوتيوب يحجب مقاطع كثيرة من IP السيرفرات ("Sign in to confirm you're not a bot")
   //         بينما ساوند كلاود يشتغل عادي.
+  //
+  // مهم: نجيب عدة نتائج ونقيّمها (مو أول نتيجة على الأعمى) عشان ما نشغّل أغنية عشوائية.
+  const MIN_SCORE = Number(process.env.MUSIC_MIN_SCORE || 0.45);
+  const SC_N = Math.max(3, Number(process.env.SC_CANDIDATES || 10));
+  const YT_N = Math.max(3, Number(process.env.YT_CANDIDATES || 6));
+
+  let bestAny = null; // أفضل مرشح من أي مصدر (نستعمله لو كلهم ضعاف)
+
   const preferYouTube = /^youtube$/i.test((process.env.PREFER_SOURCE || '').trim());
   if (!preferYouTube) {
     try {
-      const sc = await searchSoundCloud(q, 1);
+      const sc = await searchSoundCloud(q, SC_N);
       if (sc.length) {
-        log(`🔎 ساوند كلاود: ${sc[0].title}`);
-        return { type: 'single', songs: [{ ...sc[0], source: 'soundcloud' }] };
+        const { ranked, best } = rankCandidates(q, sc);
+        bestAny = best;
+        log(`🔎 ساوند كلاود (${ranked.length} نتيجة) — الأفضل: ${fmtCandidates(ranked)}`);
+        if (best.score >= MIN_SCORE) {
+          return { type: 'single', songs: [{ ...best, score: undefined, source: 'soundcloud' }], ranked };
+        }
+        log(`🤔 التطابق ضعيف (${Math.round(best.score * 100)}%) — بجرّب يوتيوب`);
       }
     } catch (e) {
       log(`⚠️ بحث ساوند كلاود فشل (بنجرّب يوتيوب): ${String(e.message).slice(0, 90)}`);
     }
   }
 
-  const results = await searchSongs(q, 1);
-  if (!results.length) throw new Error('ما لقيت أي نتيجة لهذا الاسم');
-  return { type: 'single', songs: [{ ...results[0], source: 'youtube' }] };
+  try {
+    const results = await searchSongs(q, YT_N);
+    if (results.length) {
+      const { ranked, best } = rankCandidates(q, results);
+      if (!bestAny || best.score > bestAny.score) bestAny = best;
+      log(`🔎 يوتيوب (${ranked.length} نتيجة) — الأفضل: ${fmtCandidates(ranked)}`);
+      if (best.score >= MIN_SCORE) {
+        return { type: 'single', songs: [{ ...best, score: undefined, source: 'youtube' }], ranked };
+      }
+    }
+  } catch (e) {
+    log(`⚠️ بحث يوتيوب فشل: ${String(e.message).slice(0, 90)}`);
+    if (!bestAny) {
+      const err2 = new Error(`ما قدرت أبحث الحين (${String(e.message).slice(0, 60)})`);
+      err2.code = 'SEARCH_FAILED';
+      err2.query = q;
+      throw err2;
+    }
+  }
+
+  // ما فيه مطابقة واضحة — نرفض بدل ما نشغّل شي عشوائي، ونسجّل أقرب شي للمعلومة
+  const hint = bestAny ? ` (أقرب نتيجة: "${bestAny.title}")` : '';
+  const err = new Error(`ما لقيت أغنية بالاسم هذا${hint}`);
+  err.code = 'NO_MATCH';
+  err.query = q;
+  err.closest = bestAny ? bestAny.title : null;
+  throw err;
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,6 +1638,9 @@ module.exports = {
   searchSongs,
   searchSoundCloud,
   resolveQuery,
+  scoreMatch,
+  rankCandidates,
+  normTitle,
   formatDuration,
   diagnostics,
   ensureWorkingClient,

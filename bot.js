@@ -41,6 +41,8 @@ const GUILD_ID = (process.env.GUILD_ID || '').trim();
 const VOICE_CHANNEL_ID = (process.env.VOICE_CHANNEL_ID || '').trim();
 const CHECK_MS = Math.max(5, Number(process.env.CHECK_SECONDS || 30)) * 1000;
 const LOCK_TO_CHANNEL = String(process.env.LOCK_TO_CHANNEL || 'true').toLowerCase() !== 'false';
+// ترحيب صوتي عند دخول أول شخص للروم (يشتغل كفحص تلقائي للنطق)
+const GREET_ON_JOIN = String(process.env.VOICE_GREET_ON_JOIN || 'true').toLowerCase() !== 'false';
 
 // المحادثة
 const CHAT_ENABLED = String(process.env.CHAT_ENABLED || 'true').toLowerCase() !== 'false';
@@ -483,6 +485,14 @@ function connect(guild, channel) {
             log(`💬 رد (${Date.now() - t0}ms): "${reply.text}"`);
 
             const m = music.getQueue(guild.id);
+            try {
+              const dv = music.connDave(conn);
+              log(
+                `🎧 التشفير (DAVE): ${dv?.session?.ready ? 'جاهز' : 'غير جاهز'} (v${dv?.protocolVersion ?? '?'})`,
+              );
+            } catch {
+              /* ignore */
+            }
             const stream = await speech.speak(reply.text);
             const played = await m.speak(stream, 1);
             log(`🔊 نطقنا (${Date.now() - t0}ms) — تشغيل=${played ? 'نجح' : 'ما وصل'}`);
@@ -517,6 +527,23 @@ function connect(guild, channel) {
   });
 
   conn.on('error', (err) => log('خطأ صوتي:', err.message));
+}
+
+/**
+ * نطق ترحيب عند دخول أول شخص للروم — يشتغل كفحص تلقائي لمسار الصوت كامل.
+ */
+async function greetTest(guild, who = '') {
+  const t0 = Date.now();
+  try {
+    const m = music.getQueue(guild.id);
+    const line = `يا هلا ${who}! أنا أسمعك وأرد عليك، تكلّم طبيعي.`;
+    const ogg = await speech.speak(line);
+    const played = await m.speak(ogg, 1);
+    log(`👋 ترحيب صوتي (${Date.now() - t0}ms) — تشغيل=${played ? 'نجح' : 'ما وصل'}`);
+  } catch (e) {
+    log('⚠️ النطق فشل:', String(e.message).slice(0, 160));
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +610,26 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     );
     if (newState.deaf) newState.setDeaf(false, 'إصلاح تلقائي').catch(() => {});
     if (newState.mute) newState.setMute(false, 'إصلاح تلقائي').catch(() => {});
+  }
+
+  // ترحيب/فحص صوتي عند دخول أول شخص للروم (يفيد كاختبار تلقائي للنطق)
+  try {
+    const humanJoined =
+      newState.channelId &&
+      oldState.channelId !== newState.channelId &&
+      !newState.member?.user?.bot;
+    const botChannelId = newState.guild?.members?.me?.voice?.channelId ?? null;
+    const onlyBot =
+      newState.channel && [...newState.channel.members.values()].every((mm) => mm.user?.bot);
+    if (GREET_ON_JOIN && humanJoined && botChannelId === newState.channelId && onlyBot) {
+      setTimeout(() => {
+        greetTest(newState.guild, newState.member?.displayName || 'يا هلا').catch((e) =>
+          log('⚠️ فشل الترحيب الصوتي:', String(e.message).slice(0, 140)),
+        );
+      }, 2500);
+    }
+  } catch {
+    /* ignore */
   }
 
   // طلع من الروم (انفصل / طردوه)

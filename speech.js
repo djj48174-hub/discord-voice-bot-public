@@ -27,7 +27,9 @@ const STT_TIMEOUT_MS = Math.max(5000, Number(process.env.STT_TIMEOUT_MS || 25000
 // تلميح اختياري لـ Whisper.
 // ⚠️ تحذير مهم: التلميح الطويل يخلي الموديل "يهلوس" ويردّد نص التلميح على الصمت
 // (شفناه في التشغيل: طلع "أمثلة تدريبية عامية بين شخص وبوت ديسكورد") — فخليه فاضي.
-const STT_PROMPT = (process.env.STT_PROMPT || '').trim();
+// تلميح قصير (سطر واحد) يوجّه Whisper للهجة والمجال — التلميح الطويل يسبب هلوسة
+// (شفناه في التشغيل: طلع "أمثلة تدريبية عامية بين شخص وبوت ديسكورد") فخليناه سطر واحد.
+const STT_PROMPT = (process.env.STT_PROMPT !== undefined ? String(process.env.STT_PROMPT) : 'محادثة سعودية عامية.').trim();
 
 // جُمل يخترعها Whisper على الصمت/الضجيج — نتجاهلها
 const STT_JUNK = [

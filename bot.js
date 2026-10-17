@@ -1003,7 +1003,7 @@ function forSpeech(s) {
 
 // أوامر الروم
 const V_LEAVE_RE =
-  /^(?:اطلع|اطلع من الروم|اطلع برا|اطلع من هنا|اطلع برى|اخرج|اخرج من الروم|طلعني|طلعني من الروم|اقفل الروم|قفل الروم|انزل من الروم|لا تقعد في الروم)$/;
+  /^(?:اطلع|اطلع من الروم|اطلع برا|اطلع من هنا|اطلع بري|اخرج|اخرج من الروم|طلعني|طلعني من الروم|اقفل الروم|قفل الروم|انزل من الروم|لا تقعد في الروم)$/;
 const V_JOIN_RE = /^(?:ادخل|ادخل الروم|دخل الروم|ارجع|ارجع للروم|رجعني|تعال الروم|تعال للروم)$/;
 const V_NOW_RE =
   /^(?:(?:وش|ايش)\s+(?:تشغل|شغال|الاغنيه|الاغاني|الطابور)(?:\s+الحين)?|وش اللي شغال|وش هذي الاغنيه|وش اللي تشغله)$/;
@@ -1026,7 +1026,7 @@ const V_VOL_DOWN_RE = /^(?:نزل الصوت|وطي الصوت|خفض الصوت
 const V_GENERIC_SONG_RE = /^(?:لي|اغنيه|موسيقي|شي|شيء|اي شي|اغاني|شي زين)$/;
 // طلب تشغيل أغنية بالصوت (يسمح بكلمة تمهيدية مثل "طيب" أو "يا")
 const V_PLAY_RE =
-  /^(?:(?:طيب|يا|هلا|يالله|يلا|لو سمحت|ممكن|الحين|هي|والله)\s+)*(?:شغّل لي|شغل لي|شغللي|شغّل|شغل|سمّعني|سمعني|ابغى اسمع|أبغى اسمع|ابي اسمع|أبي اسمع|play me|play)\s*[:،\-]?\s*(.+)$/i;
+  /^(?:(?:طيب|يا|هلا|يالله|يلا|لو سمحت|ممكن|الحين|هي|والله)\s+)*(?:شغّل لي|شغل لي|شغللي|شغلي|شغّللي|سمّعني|سمعني|ابغي اسمع|أبغي اسمع|ابي اسمع|أبي اسمع|شغل اغنية|شغّل أغنية|شغل اغنيه|شغّل|شغل|play me|play)\s*[:،\-]?\s*(.+)$/i;
 
 /** روم البوت الصوتي الحالي */
 function botVoiceChannel(guild) {
@@ -1036,6 +1036,24 @@ function botVoiceChannel(guild) {
 
 // آخر نتائج بحث (بالأمر الصوتي) — عشان المستخدم يقدر يقول «لا مو هذي» ونشغّل البديل
 const lastSearch = new Map(); // guildId -> { query, ranked, index }
+
+// كتابة عربية لحروف لاتينية — لأن Whisper يكتب الأسماء الأجنبية بالعربي
+// ("لاف اون ذي كاتووك") فنرتّبها لاتيني عشان نلقى الأغنية الأصلية
+const AR2LAT = {
+  ا: 'a', أ: 'a', إ: 'a', آ: 'a', ٱ: 'a', ب: 'b', ت: 't', ث: 'th', ج: 'j', ح: 'h', خ: 'kh',
+  د: 'd', ذ: 'dh', ر: 'r', ز: 'z', س: 's', ش: 'sh', ص: 's', ض: 'd', ط: 't', ظ: 'dh', ع: 'a',
+  غ: 'gh', ف: 'f', ق: 'q', ك: 'k', ل: 'l', م: 'm', ن: 'n', ه: 'h', ة: 'a', و: 'w', ي: 'y',
+  ى: 'a', ء: '', ؤ: 'w', ئ: 'y', پ: 'p', چ: 'ch', ڤ: 'v', گ: 'g',
+};
+
+function translitArabic(s) {
+  return String(s || '')
+    .split('')
+    .map((c) => (AR2LAT[c] !== undefined ? AR2LAT[c] : c))
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 /** يشغّل مرشحاً جاهزاً (نستعمله لما نقول «لا مو هذي») */
 async function playCandidate(guild, cand) {
@@ -1095,7 +1113,19 @@ async function playByVoice(guild, query) {
     return { error: e };
   });
   await speakLine(guild, 'طيب، أشوفها لك الحين.').catch(() => {});
-  const resolved = await search;
+  let resolved = await search;
+
+  // محاولة ثانية: لو الاسم أجنبي كتبه Whisper بالعربي، نحوّله لاتيني ونبحث مرة ثانية
+  if ((!resolved || resolved.error) && /[\u0600-\u06FF]/.test(query)) {
+    const lat = translitArabic(query);
+    if (lat && /[a-z]{2}/i.test(lat) && lat !== query) {
+      log(`🔁 محاولة ثانية بالإنجليزية: "${lat}"`);
+      resolved = await music.resolveQuery(lat).catch((e) => {
+        log(`⚠️ حتى بالإنجليزية ما لقيت "${lat}": ${String(e.message).slice(0, 120)}`);
+        return resolved; // نرجّع خطأ المحاولة الأولى (فيه أقرب نتيجة)
+      });
+    }
+  }
 
   if (!resolved || resolved.error || !Array.isArray(resolved.songs) || !resolved.songs.length) {
     const closest = resolved && resolved.error ? resolved.error.closest : null;
@@ -1588,5 +1618,5 @@ if (require.main === module) {
   });
 } else {
   // يسمح باختبار الأوامر الصوتية بدون تشغيل البوت (test-voicecmd.js)
-  module.exports = { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho };
+  module.exports = { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho, translitArabic };
 }

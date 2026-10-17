@@ -4,7 +4,7 @@
  */
 'use strict';
 
-const { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho } = require('./bot');
+const { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho, translitArabic } = require('./bot');
 const { isJunkTranscript } = require('./speech');
 const { scoreMatch, normTitle } = require('./music');
 
@@ -78,6 +78,13 @@ async function main() {
   ok(s7 < s2, `الريمكس أقل من الأصلي (${s7.toFixed(2)} < ${s2.toFixed(2)})`);
   ok(normTitle('شغّل  الأغنية') === 'شغل الاغنيه', 'تنظيف الهمزات والتشكيل', normTitle('شغّل  الأغنية'));
 
+  section('تحويل الأسماء الأجنبية (translitArabic)');
+  ok(
+    /^[a-z\s]+$/i.test(translitArabic('لاف اون ذي كاتووك')),
+    'اسم أجنبي بالعربي -> لاتيني: ' + translitArabic('لاف اون ذي كاتووك'),
+  );
+  ok(translitArabic('كاظم الساهر').length > 4, 'الأسماء العربية تتحول لاتيني', translitArabic('كاظم الساهر'));
+
   section('أوامر الروم بالصوت (runVoiceCommand)');
   const cases = [
     ['اطلع من الروم', (r) => r && /اطلع من/.test(r.say)],
@@ -90,6 +97,9 @@ async function main() {
     ['كرر الأغنية', (r) => r && /بكرر/.test(r.say)],
     ['وش شغال الحين', (r) => r && /ما فيه شي شغال/.test(r.say)],
     ['شغل لي أغنية', (r) => r && /وش الأغنية/.test(r.say)],
+    ['شغلي كاظم الساهر', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
+    ['شغل اغنية كاظم الساهر', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
+    ['ابغى اسمع محمد عبده', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
     ['طيب شغل لي كاظم الساهر', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
     ['ادخل الروم', (r) => r && /ما لقيت الروم الصوتي/.test(r.say)],
     ['لا مو هذي', (r) => r && /ما عندي بدائل/.test(r.say)],

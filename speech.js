@@ -44,6 +44,13 @@ const STT_JUNK = [
   'الترجمه من',
   'ترجمه من',
   'لا تنسى الاشتراك',
+  'اشتركوا في القناه',
+  'اشتركوا في القناة',
+  'لا تنسوا الاشتراك',
+  'شكرا لكم على المشاهده',
+  'المزيد من المقاطع',
+  'تابعونا',
+  'شكرا للمشاهده',
   'شكرا لكم',
 ];
 
@@ -67,6 +74,9 @@ function isJunkTranscript(text) {
   const t = sttNorm(text);
   if (!t) return true;
   if (STT_JUNK_NORM.some((j) => j && t.includes(j))) return true;
+  // تكرار نفس الجملة مرتين = هلوسة معروفة
+  const half = Math.floor(t.length / 2);
+  if (t.length > 14 && t.slice(0, half).trim() === t.slice(-half).trim()) return true;
   // لو النص كله مأخوذ من التلميح = هلوسة
   const p = sttNorm(STT_PROMPT);
   if (p) {
@@ -440,9 +450,9 @@ function oggToWav(ogg) {
         'ogg',
         '-i',
         'pipe:0',
-        // ننظّف الصوت، ونقيس مستواه *قبل* التعديل، بعدها نعدّله عشان Whisper يفهم أحسن
+        // ننظّف الصوت (تنقية ضجيج + رفع الصوت الواطي) ونقيس مستواه قبل الرفع
         '-af',
-        'highpass=f=70,volumedetect,dynaudnorm=f=200:g=12:p=0.9',
+        'highpass=f=80,afftdn=nf=-25,volumedetect,dynaudnorm=f=200:g=15:p=0.95,volume=3dB',
         '-ar',
         '16000',
         '-ac',
@@ -493,9 +503,10 @@ async function transcribe(opusPackets, opts = {}) {
   const { wav, level } = await oggToWav(ogg);
 
   // فلتر مهم: الصمت والضجيج = هلوسة. نتجاهل المقطع قبل ما نرسله أصلاً
-  // قاعدة آمنة: نقبل الصوت الواطي القصير (يمكن كلامك فعلاً)، ونرفض الصمت أو الضجيج الطويل
-  const softDb = Number(process.env.STT_MIN_DB || -38);
-  const hardDb = Number(process.env.STT_HARD_DB || -50);
+  // ملاحظة: dynaudnorm يرفع الصوت الواطي بعد هذي القياسة، فنقبل الأوطأ هنا
+  //         (وفحص ثقة Whisper no_speech_prob هو خط الدفاع الثاني).
+  const softDb = Number(process.env.STT_MIN_DB || -45);
+  const hardDb = Number(process.env.STT_HARD_DB || -55);
   const seconds = (list.length * 20) / 1000; // كل حزمة Opus ≈ 20ms
   const maxDb = level.max;
   if (maxDb != null && (maxDb <= hardDb || (maxDb <= softDb && seconds > 6))) {
@@ -508,18 +519,38 @@ async function transcribe(opusPackets, opts = {}) {
   const form = new FormData();
   form.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
   form.append('model', STT_MODEL);
-  form.append('response_format', 'json');
+  // verbose_json يعطينا ثقة الموديل (نرفض الهلوسة قبل ما نرد بشي غلط)
+  form.append('response_format', 'verbose_json');
   form.append('temperature', '0');
   if (opts.language) form.append('language', opts.language);
   const prompt = opts.prompt || STT_PROMPT;
   if (prompt) form.append('prompt', prompt);
 
-  const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+  let res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${GROQ_KEY}` },
     body: form,
     signal: AbortSignal.timeout(STT_TIMEOUT_MS),
   });
+
+  // لو المزوّد ما يدعم verbose_json نرجع للصيغة العادية
+  if (res.status === 400) {
+    const txt0 = await res.text().catch(() => '');
+    if (/response_format|verbose/i.test(txt0)) {
+      form.set('response_format', 'json');
+      res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GROQ_KEY}` },
+        body: form,
+        signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+      });
+    } else {
+      const err0 = new Error(`Whisper 400: ${txt0.slice(0, 200)}`);
+      err0.status = 400;
+      err0.body = txt0;
+      throw err0;
+    }
+  }
 
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
@@ -531,6 +562,31 @@ async function transcribe(opusPackets, opts = {}) {
 
   const data = await res.json();
   const text = String(data?.text || '').trim();
+
+  // ---- فحص ثقة Whisper: أسرع وأدق طريقة لقتل الهلوسة ----
+  const segs = Array.isArray(data?.segments) ? data.segments : [];
+  if (segs.length) {
+    const noSpeech = Math.max(...segs.map((s) => Number(s.no_speech_prob) || 0));
+    const comp = Math.max(...segs.map((s) => Number(s.compression_ratio) || 0));
+    const avgLog = segs.reduce((a, s) => a + (Number(s.avg_logprob) || 0), 0) / segs.length;
+    const noSpeechMax = Number(process.env.STT_NO_SPEECH || 0.6);
+    const compMax = Number(process.env.STT_COMPRESSION || 2.4);
+    const logMin = Number(process.env.STT_LOGPROB || -1.3);
+
+    if (noSpeech > noSpeechMax) {
+      log(`🙈 تجاهلت مقطع (يغلب أنه صمت/ضجيج: ${noSpeech.toFixed(2)})، النص كان: "${text.slice(0, 50)}"`);
+      return { text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } };
+    }
+    if (comp > compMax) {
+      log(`🙈 تجاهلت مقطع (تكرار/هلوسة: ${comp.toFixed(2)})، النص: "${text.slice(0, 50)}"`);
+      return { text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } };
+    }
+    if (avgLog < logMin) {
+      log(`🙈 تجاهلت مقطع (ثقة واطية: ${avgLog.toFixed(2)})، النص: "${text.slice(0, 50)}"`);
+      return { text: '', junk: true, raw: text, level, conf: { noSpeech, comp, avgLog } };
+    }
+  }
+
   // نرفض الهلوسة (نصوص اخترعها الموديل على صوت مو كلام)
   if (!text || isJunkTranscript(text)) {
     log(`🚫 تفريغ مرفوض (هلوسة/فاضي): "${text.slice(0, 70)}"`);

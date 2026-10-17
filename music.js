@@ -558,6 +558,14 @@ async function resolveQuery(query, maxPlaylist = 25) {
   let bestRanked = [];
 
   const preferYouTube = /^youtube$/i.test((process.env.PREFER_SOURCE || '').trim());
+  // هل يوتيوب شغّال من هذا السيرفر؟ (فحص العملاء يصير عند التشغيل)
+  // على سيرفرات كثيرة يوتيوب يحجب IP السيرفر — نتخطاه بسرعة بدل ما نضيّع دقيقة على الفاضي
+  const forceYt = String(process.env.YTDLP_FORCE_YOUTUBE || '').toLowerCase() === 'true';
+  const ytUsable = preferYouTube || forceYt || (Boolean(activeClient) && clientResults.get(activeClient) === true);
+  if (!ytUsable) {
+    log('⏭️ يوتيوب مو متاح من هنا — نعتمد ساوند كلاود');
+  }
+
   if (!preferYouTube) {
     try {
       const sc = await searchSoundCloud(q, SC_N);
@@ -576,26 +584,28 @@ async function resolveQuery(query, maxPlaylist = 25) {
     }
   }
 
-  try {
-    const results = await searchSongs(q, YT_N);
-    if (results.length) {
-      const { ranked, best } = rankCandidates(q, results);
-      if (!bestAny || best.score > bestAny.score) {
-        bestAny = best;
-        bestRanked = ranked;
+  if (ytUsable) {
+    try {
+      const results = await searchSongs(q, YT_N);
+      if (results.length) {
+        const { ranked, best } = rankCandidates(q, results);
+        if (!bestAny || best.score > bestAny.score) {
+          bestAny = best;
+          bestRanked = ranked;
+        }
+        log(`🔎 يوتيوب (${ranked.length} نتيجة) — الأفضل: ${fmtCandidates(ranked)}`);
+        if (best.score >= MIN_SCORE) {
+          return { type: 'single', songs: [{ ...best, score: undefined, source: 'youtube' }], ranked };
+        }
       }
-      log(`🔎 يوتيوب (${ranked.length} نتيجة) — الأفضل: ${fmtCandidates(ranked)}`);
-      if (best.score >= MIN_SCORE) {
-        return { type: 'single', songs: [{ ...best, score: undefined, source: 'youtube' }], ranked };
+    } catch (e) {
+      log(`⚠️ بحث يوتيوب فشل: ${String(e.message).slice(0, 90)}`);
+      if (!bestAny) {
+        const err2 = new Error(`ما قدرت أبحث الحين (${String(e.message).slice(0, 60)})`);
+        err2.code = 'SEARCH_FAILED';
+        err2.query = q;
+        throw err2;
       }
-    }
-  } catch (e) {
-    log(`⚠️ بحث يوتيوب فشل: ${String(e.message).slice(0, 90)}`);
-    if (!bestAny) {
-      const err2 = new Error(`ما قدرت أبحث الحين (${String(e.message).slice(0, 60)})`);
-      err2.code = 'SEARCH_FAILED';
-      err2.query = q;
-      throw err2;
     }
   }
 

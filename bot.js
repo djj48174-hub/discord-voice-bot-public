@@ -329,6 +329,85 @@ const healthServer = http.createServer(async (req, res) => {
         return;
       }
 
+      // فحص تشغيل أغنية فعلياً: ?song=اسم الأغنية (يبحث ويشغّل ويرجّع النتيجة)
+      const songQ = (u.searchParams.get('song') || '').trim();
+      if (songQ) {
+        const send = (obj, code = 200) => {
+          res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(obj, null, 2));
+        };
+        const gid = u.searchParams.get('guild') || GUILD_ID || client.guilds.cache.first()?.id;
+        const g = client.guilds.cache.get(gid) || client.guilds.cache.first();
+        if (!g) {
+          send({ error: 'ما فيه سيرفر' }, 404);
+          return;
+        }
+        const conn = getVoiceConnection(g.id);
+        if (!conn) {
+          send({ error: `البوت مو في روم صوتي بسيرفر ${g.name}` }, 409);
+          return;
+        }
+        const m = music.getQueue(g.id);
+        try {
+          music.attachPlayerToConnection(g.id, conn);
+        } catch {
+          /* ignore */
+        }
+        const states = [];
+        const onState = (o, n) => states.push(`${o.status} -> ${n.status}`);
+        m.player.on('stateChange', onState);
+        const t0 = Date.now();
+        let resolved;
+        try {
+          resolved = await music.resolveQuery(songQ);
+        } catch (e) {
+          resolved = { error: e };
+        }
+        if (!resolved || resolved.error || !Array.isArray(resolved.songs)) {
+          setTimeout(() => m.player.off('stateChange', onState), 1000);
+          send({
+            ok: false,
+            stage: 'البحث',
+            query: songQ,
+            error: String(resolved?.error?.message || 'فشل البحث').slice(0, 300),
+            closest: resolved?.error?.closest ?? null,
+            ms: Date.now() - t0,
+          });
+          return;
+        }
+        const first = resolved.songs[0];
+        m.songs.push(...resolved.songs);
+        const waitMs = Math.max(5, Number(u.searchParams.get('wait') || 45)) * 1000;
+        const resolveMs = Date.now() - t0;
+        const played = await m.startAndWait(waitMs).catch(() => false);
+        const cd = music.connConnectionData(conn);
+        const out = {
+          ok: Boolean(played),
+          query: songQ,
+          title: first.title,
+          source: first.source || null,
+          weak: Boolean(resolved.weak),
+          resolveMs,
+          totalMs: Date.now() - t0,
+          playerStatus: m.player.state.status,
+          packetsPlayed: cd?.packetsPlayed ?? null,
+          states,
+        };
+        setTimeout(() => m.player.off('stateChange', onState), 2000);
+        send(out);
+        // نوقف الأغنية بعد الفحص (إلا لو keep=1)
+        if (u.searchParams.get('keep') !== '1') {
+          setTimeout(() => {
+            try {
+              m.stopAll();
+            } catch {
+              /* ignore */
+            }
+          }, 2500);
+        }
+        return;
+      }
+
       const data = await music.diagnose({
         query: u.searchParams.get('q') || '',
         vids: u.searchParams.get('vids') || '',

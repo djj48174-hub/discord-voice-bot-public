@@ -867,15 +867,16 @@ function connect(guild, channel) {
           const intent = voiceToggleIntent(text, playingNow);
           if (intent) {
             const wasOn = st.voiceOn;
-            setVoiceChat(intent === 'on', `بالكلام من ${name}`, guild.id);
+            setVoiceChat(intent === 'on', `بالكلام من ${name}: «${text.slice(0, 50)}»`, guild.id);
             st.voiceChat?.setSpeaking(true);
             try {
-              if (wasOn !== st.voiceOn || intent === 'on') {
+              if (wasOn !== st.voiceOn) {
                 await speakLine(
                   guild,
+                  // الإيقاف: تأكيد قصير جداً (عشان ما نطوّل الكلام وهو يبي سكوت)
                   intent === 'on'
                     ? 'تم، شغلت الرد الصوتي. تفضل تكلم وأنا معك.'
-                    : 'تم، وقفت الرد الصوتي. لو تبي أرجعه قل: شغل الرد الصوتي.',
+                    : 'تم.',
                 );
               }
             } catch (e) {
@@ -1506,19 +1507,17 @@ const VOICE_ON_PHRASES = [
   'شغل المحادثه الصوتيه',
   'فعل المحادثه الصوتيه',
   'افتح المحادثه الصوتيه',
-  'شغل الصوت',
   'كلمني',
   'تكلم معي',
-  'تكلم',
-  'اتكلم',
   'رد علي',
   'عطني كلمه',
   'قول شي',
 ];
 
-// صيغة عامة للتشغيل: فعل تشغيل + (الرد/الكلام/السوالف/المحادثة/الصوت)
+// صيغة عامة للتشغيل: فعل تشغيل + (الرد/الكلام/السوالف/المحادثة)
+// ملاحظة: «الصوت» مستثناة عمداً — «شغل الصوت» تنقال كثير في الألعاب وما نقصدها
 const VOICE_ON_RE =
-  /(?:شغل|فعل|افتح|رجع|تشغل)\s+(?:ال)?(?:رد|ردك|ردودك|الكلام|كلامك|سوالف|السوالف|سواليف|السواليف|المحادثه|محادثتك|الصوت|صوتك)/;
+  /(?:شغل|فعل|افتح|رجع|تشغل)\s+(?:ال)?(?:رد|ردك|ردودك|الكلام|كلامك|سوالف|السوالف|سواليف|السواليف|المحادثه|محادثتك)/;
 
 /**
  * يفحص إذا النص أمر تشغيل/إيقاف للرد الصوتي.
@@ -2095,7 +2094,11 @@ client.on('messageCreate', async (message) => {
     })();
     const vIntent = voiceToggleIntent(text, playingTxt);
     if (vIntent) {
-      const on = setVoiceChat(vIntent === 'on', `بالكتابة من ${message.author.tag}`, message.guild?.id);
+      const on = setVoiceChat(
+        vIntent === 'on',
+        `بالكتابة من ${message.author.tag}: «${String(text || '').slice(0, 50)}»`,
+        message.guild?.id,
+      );
       await message.reply({
         content: on
           ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'

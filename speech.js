@@ -21,8 +21,14 @@ function log(...args) {
 // الإعدادات
 // ---------------------------------------------------------------------------
 const GROQ_KEY = (process.env.GROQ_API_KEY || '').trim();
-const STT_MODEL = (process.env.STT_MODEL || 'whisper-large-v3-turbo').trim();
+// whisper-large-v3 أدق للعامية الخليجية (turbo أسرع لكنه يغلط أكثر)
+const STT_MODEL = (process.env.STT_MODEL || 'whisper-large-v3').trim();
 const STT_TIMEOUT_MS = Math.max(5000, Number(process.env.STT_TIMEOUT_MS || 25000));
+// تلميح يساعد Whisper يفهم العامية السعودية وأسماء الأشياء عندنا
+const STT_PROMPT = (
+  process.env.STT_PROMPT ||
+  'محادثة صوتية سعودية عامية بين شخص وبوت ديسكورد. أمثلة: وش أخبارك، من اللي سواك، شغّل لي أغنية، اطلع من الروم، تبي قهوة، كيف حالك اليوم.'
+).trim();
 
 const TTS_RATE = (process.env.TTS_RATE || '+8%').trim();
 
@@ -388,8 +394,10 @@ async function transcribe(opusPackets, opts = {}) {
   form.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
   form.append('model', STT_MODEL);
   form.append('response_format', 'json');
+  form.append('temperature', '0');
   if (opts.language) form.append('language', opts.language);
-  if (opts.prompt) form.append('prompt', opts.prompt);
+  const prompt = opts.prompt || STT_PROMPT;
+  if (prompt) form.append('prompt', prompt);
 
   const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
     method: 'POST',

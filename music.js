@@ -34,6 +34,30 @@ function log(...args) {
   console.log(`[${new Date().toISOString()}]`, '[music]', ...args);
 }
 
+/** كم ننتظر جلسة التشفير (DAVE) تكون جاهزة قبل ما ننطق */
+const DAVE_WAIT_MS = Math.max(0, Number(process.env.DAVE_WAIT_MS || 2000));
+
+/**
+ * ننتظر لين جلسة DAVE (E2EE) تصير جاهزة — قبلها الصوت يروح بدون تشفير
+ * وأجهزة الطرف الثاني تسكته (صمت من غير أي خطأ ظاهر).
+ * @returns true = جاهزة (أو DAVE مو مفعّل بالأصل)، false = ما جهزت خلال المهلة
+ */
+async function waitForDaveReady(connection, maxMs = DAVE_WAIT_MS) {
+  if (!connection) return true;
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const d = connDave(connection);
+      if (!d || (d.protocolVersion ?? 0) === 0) return true; // ما فيه تشفير E2EE
+      if (d.session?.ready) return true;
+    } catch {
+      return true;
+    }
+    if (Date.now() - t0 >= maxMs) return false;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+}
+
 /** بيانات الاتصال الفعلية (packetsPlayed/sequence/ssrc/التشفير) — مصدرها كائن الشبكة */
 function connConnectionData(connection) {
   try {
@@ -846,12 +870,17 @@ class GuildMusic {
    * ينطق نصاً (Ogg Opus 48kHz — نفس صيغة الموسيقى بالضبط) ويرجّع true لو اشتغل.
    */
   speak(oggBuffer, volume = 1) {
-    this.pauseForVoice();
     this._voiceReplyActive = true;
     const savedSong = this.current;
-    const packetsBefore = countPlayedPackets(this.connection);
 
-    return new Promise((resolve) => {
+    return (async () => {
+      // مهم: ننتظر جلسة E2EE تجهز قبل النطق، وإلا الصوت ينرسل بدون تشفير ويسكت عند المستمع
+      const daveOk = await waitForDaveReady(this.connection);
+      if (!daveOk) log('⚠️ التشفير (DAVE) مو جاهز — ممكن المستمع ما يسمع الصوت');
+
+      this.pauseForVoice();
+      const packetsBefore = countPlayedPackets(this.connection);
+      return new Promise((resolve) => {
       let done = false;
       let sawPlaying = false;
       let timer = null;
@@ -934,7 +963,8 @@ class GuildMusic {
         log('⚠️ فشل النطق:', e.message);
         finish(false, e.message);
       }
-    });
+      });
+    })();
   }
 
   /** يوقف كل شي بما فيه الموسيقى (للمحادثة الصوتية) */
@@ -1448,4 +1478,5 @@ module.exports = {
   countPlayedPackets,
   connConnectionData,
   connDave,
+  waitForDaveReady,
 };

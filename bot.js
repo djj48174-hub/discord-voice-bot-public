@@ -535,6 +535,11 @@ function connect(guild, channel) {
 async function greetTest(guild, who = '') {
   const t0 = Date.now();
   try {
+    const conn = getVoiceConnection(guild.id);
+    // ننتظر لين تشفير E2EE يجهز (وإلا الصوت ينرسل بدون تشفير ويسكت عند المستمع)
+    const daveOk = await music.waitForDaveReady(conn, 6000);
+    log(`🎧 التشفير (DAVE) عند الترحيب: ${daveOk ? 'جاهز' : 'غير جاهز'}`);
+    if (voiceChat) voiceChat.setSpeaking(true);
     const m = music.getQueue(guild.id);
     const line = `يا هلا ${who}! أنا أسمعك وأرد عليك، تكلّم طبيعي.`;
     const ogg = await speech.speak(line);
@@ -543,6 +548,8 @@ async function greetTest(guild, who = '') {
   } catch (e) {
     log('⚠️ النطق فشل:', String(e.message).slice(0, 160));
     throw e;
+  } finally {
+    if (voiceChat) voiceChat.setSpeaking(false);
   }
 }
 

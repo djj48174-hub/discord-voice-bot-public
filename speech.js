@@ -24,24 +24,27 @@ const GROQ_KEY = (process.env.GROQ_API_KEY || '').trim();
 const STT_MODEL = (process.env.STT_MODEL || 'whisper-large-v3-turbo').trim();
 const STT_TIMEOUT_MS = Math.max(5000, Number(process.env.STT_TIMEOUT_MS || 25000));
 
-const TTS_VOICE = (process.env.TTS_VOICE || 'ar-SA-HamedNeural').trim();
 const TTS_RATE = (process.env.TTS_RATE || '+8%').trim();
 
-// أصوات عربية بديلة (تتناوب عليها عشان ما يطلع الصوت ممل)
-const ARABIC_VOICES = [
-  'ar-SA-HamedNeural',
-  'ar-EG-ShakirNeural',
-  'ar-SA-ZariyahNeural',
-  'ar-AE-FatimaNeural',
-  'ar-KW-NaayfNeural',
-  'ar-JO-TaimNeural',
+// أصوات عربية *رجالية* فقط — نحافظ على هوية صوتية واحدة ثابتة للبوت
+const MALE_ARABIC_VOICES = [
+  'ar-SA-HamedNeural', // سعودي (رجالي)
+  'ar-KW-NaayfNeural', // كويتي (رجالي)
+  'ar-JO-TaimNeural', // أردني (رجالي)
+  'ar-EG-ShakirNeural', // مصري (رجالي)
 ];
-let voiceCursor = 0;
+// الصوت الأساسي (ثابت) — والباقي للاحتياط فقط عند فشل الصوت الأساسي
+const TTS_VOICE = (process.env.TTS_VOICE || MALE_ARABIC_VOICES[0]).trim();
 
+let voiceCursor = 0;
+/** الصوت الأساسي الرجالي (يتغيّر فقط عند فشل الصوت الأساسي) */
 function nextVoice() {
-  const v = ARABIC_VOICES[voiceCursor % ARABIC_VOICES.length];
-  voiceCursor++;
-  return v;
+  return TTS_VOICE;
+}
+/** قائمة الأصوات الرجالية للتجربة بالترتيب (الأساسي أولاً) */
+function voiceFallbacks(primary) {
+  const base = primary || TTS_VOICE;
+  return [base, ...MALE_ARABIC_VOICES.filter((v) => v !== base)];
 }
 
 // ---------------------------------------------------------------------------
@@ -80,8 +83,9 @@ function streamToBuffer(stream) {
  * أي صوت (mp3/webm/wav/ogg) -> Ogg Opus 48kHz ستيريو بنفس إعدادات نغمة الاختبار.
  * نعيد الترميز دائماً (مو remux) عشان ديسكورد يسمع بوضوح.
  */
-function toDiscordOgg(inputBuf) {
+function toDiscordOgg(inputBuf, extraFilter = '') {
   return new Promise((resolve, reject) => {
+    const af = ['aresample=48000', 'volume=2.5', extraFilter].filter(Boolean).join(',');
     const ff = spawn(
       ffmpegPath(),
       [
@@ -91,7 +95,7 @@ function toDiscordOgg(inputBuf) {
         '-i',
         'pipe:0',
         '-af',
-        'aresample=48000,volume=2.5',
+        af,
         '-c:a',
         'libopus',
         '-b:a',
@@ -199,19 +203,30 @@ async function speakGoogle(text) {
   if (!res.ok) throw new Error(`Google TTS ${res.status}`);
   const mp3 = Buffer.from(await res.arrayBuffer());
   if (mp3.length < 500) throw new Error('صوت فاضي من Google TTS');
-  return toDiscordOgg(mp3);
+  // صوت قوقل نسائي -> ننزّل النبرة عشان يصير رجالي (احتياطي أخير فقط)
+  const maleShift = extraFilterMale(process.env.GOOGLE_TTS_MALE === 'false' ? '' : 'google');
+  return toDiscordOgg(mp3, maleShift);
+}
+
+/** فلتر تنزيل النبرة (رجالي) — يُستخدم للاحتياطي النسائي فقط */
+function extraFilterMale(provider) {
+  if (provider !== 'google') return '';
+  return 'aresample=24000,asetrate=24000*0.85,aresample=48000,atempo=1.1765';
 }
 
 /**
  * محرّك Edge TTS (أصوات مايكروسوفت العربية) — مجاني لكن يتقيّد (429).
  */
 async function speakEdge(text, opts = {}) {
+  const voices = voiceFallbacks(opts.voice);
   let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < Math.min(3, voices.length); attempt++) {
     try {
       const tts = new MsEdgeTTS();
-      await tts.setMetadata(opts.voice || nextVoice(), OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+      await tts.setMetadata(voices[attempt], OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
       const { audioStream } = await tts.toStream(text, { rate: opts.rate || TTS_RATE });
+
+      if (attempt === 0) log(`🎙️ الصوت: ${voices[attempt]} (رجالي)`);
 
       const mp3 = await streamToBuffer(audioStream);
       if (mp3.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
@@ -219,7 +234,7 @@ async function speakEdge(text, opts = {}) {
     } catch (e) {
       lastErr = e;
       const msg = String(e.message || e);
-      log(`⚠️ محاولة Edge ${attempt + 1} فشلت: ${msg.slice(0, 90)}`);
+      log(`⚠️ محاولة Edge (${voices[attempt]}) ${attempt + 1} فشلت: ${msg.slice(0, 90)}`);
       // 429 = تقييد — ننتقل للاحتياطي بسرعة
       if (/\b429\b|rate.?limit|throttl/i.test(msg)) break;
       await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
@@ -277,15 +292,15 @@ async function speak(text, opts = {}) {
   throw lastErr || new Error('فشل توليد الصوت');
 }
 
-/** نطق عربي سعودي عبر Groq (أصوات: abdullah, fahad, sultan, lulwa, noura, aisha) */
-const GROQ_TTS_VOICES = ['abdullah', 'fahad', 'sultan', 'lulwa', 'noura', 'aisha'];
+/** أصوات Groq Orpheus العربية *الرجالية* فقط (+ abdullah, fahad, sultan) */
+const GROQ_MALE_VOICES = ['abdullah', 'fahad', 'sultan'];
+const GROQ_TTS_VOICE = (process.env.GROQ_TTS_VOICE || GROQ_MALE_VOICES[0]).trim();
 const GROQ_TTS_MODEL = (
   process.env.GROQ_TTS_MODEL || 'canopylabs/orpheus-arabic-saudi'
 ).trim();
-let groqVoiceCursor = 0;
 
 async function speakGroq(text, opts = {}) {
-  const voice = opts.groqVoice || GROQ_TTS_VOICES[groqVoiceCursor++ % GROQ_TTS_VOICES.length];
+  const voice = opts.groqVoice || GROQ_TTS_VOICE;
   const res = await fetch('https://api.groq.com/openai/v1/audio/speech', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_KEY}` },

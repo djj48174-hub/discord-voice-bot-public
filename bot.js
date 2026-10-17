@@ -88,6 +88,9 @@ function botChannelOf(guild) {
 // آخر كلام صوتي (للفحص): أي سيرفر سمع منه، وش قال، وش رددنا
 let lastVoice = null;
 
+// سجل آخر عمليات تشغيل/إيقاف الرد الصوتي (للفحص من /health)
+const voiceToggleHistory = [];
+
 // (الرد الصوتي لكل سيرفر حالته الخاصة — انظر gs().voiceOn)
 
 // مهلة السماح لمحاولة الاتصال قبل ما نعتبرها فاشلة ونعيدها
@@ -541,6 +544,8 @@ const healthServer = http.createServer(async (req, res) => {
         lastVoice: lastVoice,
         // أوامر الموسيقى بالصوت: مقفلة = الأوامر من الشات فقط
         voiceSongCommands: VOICE_SONG_COMMANDS,
+        // آخر عمليات تشغيل/إيقاف الرد الصوتي (لمعرفة متى انطفأ وبأي كلمة)
+        voiceToggles: voiceToggleHistory,
         music: guild
           ? (() => {
               try {
@@ -958,6 +963,11 @@ function connect(guild, channel) {
             );
           } catch {
             /* ignore */
+          }
+          // لو أحد طفّى الرد الصوتي (من الشات مثلاً) وهو جايب الرد — ما ننطقه
+          if (!st.voiceOn) {
+            log(`⛔ الرد الصوتي متوقف — ما نطقت الجواب «${guild.name}»`);
+            return;
           }
           const stream = await speech.speak(reply.text);
           st.lastSpoken = reply.text;
@@ -1459,7 +1469,33 @@ const VOICE_OFF_PHRASES = [
   'اقفل الصوت',
   'لا ترد علي',
   'خلك ساكت',
+  // صيغ السكوت الدارجة («اسكت»، «سكوت»، «انطم» …)
+  'اسكت',
+  'اسكت انت',
+  'انت اسكت',
+  'بس اسكت',
+  'خلاص اسكت',
+  'اسكت شوي',
+  'سكوت',
+  'انطم',
+  'لا تتكلم',
+  'لا تكلم',
+  'لا تسولف',
+  'لا تهرج',
+  // أوامر مركّبة (وقف/اقفل + الكلام أو السوالف)
+  'وقف الكلام',
+  'وقف السوالف',
+  'وقف السواليف',
+  'سكر السوالف',
+  'سكر السواليف',
+  'اقفل السوالف',
+  'طفي السوالف',
+  'عطل السوالف',
 ];
+
+// صيغة عامة: فعل إيقاف + (الرد/الكلام/السوالف/المحادثة/الصوت)
+const VOICE_OFF_RE =
+  /(?:وقف|اوقف|اطفي|طفي|اقفل|قفل|سكر|اسكر|بطل|الغ|الغي|عطل|كتم|اكتم)\s+(?:ال)?(?:رد|ردك|ردودك|الكلام|كلامك|سوالف|السوالف|سواليف|السواليف|المحادثه|محادثتك|الصوت|صوتك|نفسك|فمك|هرجك)/;
 
 // عبارات تشغيل الرد الصوتي
 const VOICE_ON_PHRASES = [
@@ -1473,7 +1509,16 @@ const VOICE_ON_PHRASES = [
   'شغل الصوت',
   'كلمني',
   'تكلم معي',
+  'تكلم',
+  'اتكلم',
+  'رد علي',
+  'عطني كلمه',
+  'قول شي',
 ];
+
+// صيغة عامة للتشغيل: فعل تشغيل + (الرد/الكلام/السوالف/المحادثة/الصوت)
+const VOICE_ON_RE =
+  /(?:شغل|فعل|افتح|رجع|تشغل)\s+(?:ال)?(?:رد|ردك|ردودك|الكلام|كلامك|سوالف|السوالف|سواليف|السواليف|المحادثه|محادثتك|الصوت|صوتك)/;
 
 /**
  * يفحص إذا النص أمر تشغيل/إيقاف للرد الصوتي.
@@ -1483,14 +1528,22 @@ const VOICE_ON_PHRASES = [
  */
 function voiceToggleIntent(raw, playing = false) {
   const t = normAr(raw);
-  if (!t || t.length > 45) return null;
+  if (!t || t.length > 60) return null;
   // «وقف الصوت / اقفل الصوت / وقف» وأمثالها: لو فيه أغنية شغالة يقصد يوقفها
-  if (playing && /^(?:وقف|اوقف|وقفها|اقفل|قفل|طفي|اطفي|سكر|اسكر)\s*(?:ال)?(?:صوت|صوتك)?(?: الحين)?$/.test(t)) {
+  // (بس هذا فقط لما تكون أوامر الصوت مفعّلة — الحين الأوامر من الشات)
+  if (
+    VOICE_SONG_COMMANDS &&
+    playing &&
+    /^(?:وقف|اوقف|وقفها|اقفل|قفل|طفي|اطفي|سكر|اسكر)\s*(?:ال)?(?:صوت|صوتك)?(?: الحين)?$/.test(t)
+  ) {
     return null;
   }
+  // نسوّي حدود للكلمات عشان «اسكت» ما تطابق «اسكتت» مثلاً
+  const pad = ` ${t} `;
+  const hasPhrase = (list) => list.some((p) => pad.includes(` ${p} `));
   // نفحص الإيقاف أول (لأن "لا ترد علي" تحتوي "رد علي")
-  if (VOICE_OFF_PHRASES.some((p) => t.includes(p))) return 'off';
-  if (VOICE_ON_PHRASES.some((p) => t.includes(p))) return 'on';
+  if (hasPhrase(VOICE_OFF_PHRASES) || VOICE_OFF_RE.test(t)) return 'off';
+  if (hasPhrase(VOICE_ON_PHRASES) || VOICE_ON_RE.test(t)) return 'on';
   return null;
 }
 
@@ -1511,9 +1564,26 @@ function setVoiceChat(on, by = '', guildId = '') {
     } catch {
       /* ignore */
     }
+    // لو طفّى الرد الصوتي وهو يتكلم الحين — نسكّته فوراً
+    if (!s.voiceOn) {
+      try {
+        const m = music.hasQueue(id) ? music.getQueue(id) : null;
+        if (m && m._voiceReplyActive) m.player.stop(true);
+      } catch {
+        /* ignore */
+      }
+      s.pending = null;
+    }
   }
   const where = guildId ? `«${client.guilds.cache.get(String(guildId))?.name ?? guildId}»` : 'كل السيرفرات';
   log(`🎚️ الرد الصوتي ${where}: ${on ? 'شغّال ✅' : 'متوقف ⛔'}${by ? ` — ${by}` : ''}`);
+  voiceToggleHistory.push({
+    at: new Date().toISOString(),
+    guildId: guildId ? String(guildId) : null,
+    on: Boolean(on),
+    by: String(by || '').slice(0, 80),
+  });
+  if (voiceToggleHistory.length > 12) voiceToggleHistory.shift();
   return Boolean(on);
 }
 
@@ -2029,9 +2099,10 @@ client.on('messageCreate', async (message) => {
       await message.reply({
         content: on
           ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'
-          : '⛔ وقفت الرد الصوتي.\n' +
+          : '⛔ وقفت الرد الصوتي — من الحين ما أتكلم في الروم.\n' +
               'ترجعه بإحدى الطرق:\n' +
               '• `/voice` → **تشغيل**\n' +
+              '• أو اكتب هنا: **شغّل الرد الصوتي**\n' +
               '• أو قل في الروم بالصوت: **«شغّل الرد الصوتي»**',
         allowedMentions: { repliedUser: false },
       });

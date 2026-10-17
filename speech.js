@@ -341,6 +341,33 @@ function setTtsCooldown(p, ms, why) {
 }
 
 /**
+ * كاش للنطق: الجُمل القصيرة المتكررة (تأكيدات الأوامر) تُنطق فوراً بلا انتظار المحرّك.
+ * مهم لأوامر مثل "طيب، وقفتها." — المستخدم يبي الإيقاف يحس بسرعة.
+ */
+const ttsCache = new Map(); // key -> Buffer
+const TTS_CACHE_MAX = Math.max(0, Number(process.env.TTS_CACHE_MAX || 40));
+
+function ttsCacheKey(text, opts) {
+  if (!TTS_CACHE_MAX || text.length > 140) return null;
+  return `${text}|${opts.voice || TTS_VOICE}|${TTS_SPEED}`;
+}
+
+function ttsCacheGet(key) {
+  if (!key) return null;
+  const buf = ttsCache.get(key);
+  if (!buf) return null;
+  ttsCache.delete(key); // نرجعه لآخر القائمة (LRU)
+  ttsCache.set(key, buf);
+  return buf;
+}
+
+function ttsCacheSet(key, buf) {
+  if (!key || !buf || buf.length < 500) return;
+  ttsCache.set(key, buf);
+  while (ttsCache.size > TTS_CACHE_MAX) ttsCache.delete(ttsCache.keys().next().value);
+}
+
+/**
  * يرجّع صوتاً (Ogg Opus 48kHz ستيريو) جاهزاً للتشغيل في ديسكورد مباشرة.
  * الترتيب عبر TTS_ORDER — الافتراضي: Edge (صوت سعودي رجالي ثابت) -> Groq -> Google
  * سبب ترتيب Edge أولاً: Groq Orpheus يتقيّد كثير (429) فيتغيّر الصوت فجأة.
@@ -348,6 +375,13 @@ function setTtsCooldown(p, ms, why) {
 async function speak(text, opts = {}) {
   const clean = String(text || '').trim();
   if (!clean) throw new Error('ما فيه نص للنطق');
+
+  const cacheKey = ttsCacheKey(clean, opts);
+  const cached = ttsCacheGet(cacheKey);
+  if (cached) {
+    log(`⚡ صوت من الكاش (${cached.length} بايت): "${clean.slice(0, 40)}"`);
+    return cached;
+  }
 
   const order = String(process.env.TTS_ORDER || 'edge,groq,google')
     .split(',')
@@ -369,16 +403,19 @@ async function speak(text, opts = {}) {
         if (!GROQ_KEY) throw new Error('ما فيه مفتاح Groq للنطق');
         const ogg = await speakGroq(clean, opts);
         log(`🔊 صوت جاهز (Groq ${GROQ_TTS_VOICE}): ${ogg.length} بايت`);
+        ttsCacheSet(cacheKey, ogg);
         return ogg;
       }
       if (provider === 'edge') {
         const ogg = await speakEdge(clean, opts);
         log(`🔊 صوت جاهز (Edge ${opts.voice || TTS_VOICE}): ${ogg.length} بايت`);
+        ttsCacheSet(cacheKey, ogg);
         return ogg;
       }
       if (provider === 'google') {
         const ogg = await speakGoogle(clean);
         log(`🔊 صوت جاهز (Google): ${ogg.length} بايت`);
+        ttsCacheSet(cacheKey, ogg);
         return ogg;
       }
     } catch (e) {
@@ -528,16 +565,52 @@ function captureDebug(withAudio = false) {
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_STT_MODELS = (
   process.env.GEMINI_STT_MODELS ||
-  // ترتيب مجرّب على تسجيلات المستخدم الحقيقية:
-  //   gemini-3.5-flash  = أدق واحد (سمع "والله جوعان بروح آكل" صح) ≈ 1.5-2.5s مع إلغاء التفكير
-  //   gemini-flash-latest = قريب منه لكن أبطأ
-  //   الموديلات lite أسرع لكنها هلّوست على صوته (تجي احتياط أخير)
-  'gemini-3.5-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-flash-lite-latest'
+  // الترتيب مجرّب على تسجيلات المستخدم الحقيقية (1.5s مقطع همس — أصعب حالة):
+  //   gemini-3.5-flash        2-3.7s  دقيق
+  //   gemini-flash-latest     2.5s    دقيق
+  //   gemini-3.1-flash-lite   2.0s    دقيق (سمع "والله جوع بروح آكل" صح!)
+  //   gemini-3-flash-preview  1.7s    مقبول
+  //   الموديلات lite-… الأخيرة أسرع (1.2s) لكن تهلوس على صوته → احتياط أخير
+  //   gemini-3.7-flash        ~10s    بطيء جداً → آخر واحد
+  'gemini-3.5-flash,gemini-flash-latest,gemini-3.1-flash-lite,gemini-3-flash-preview,' +
+    'gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.7-flash'
 )
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-const geminiSttCool = new Map(); // model -> until
+// model -> { until, fails }  — فترة توقف تتضاعف مع تكرار الفشل (429 حصة → نرجع بسرعة)
+const geminiSttCool = new Map();
+
+function sttModelReady(m) {
+  const c = geminiSttCool.get(m);
+  return !c || Date.now() >= c.until;
+}
+
+/** يستخرج "retryDelay": "7s" من رد جوجل */
+function parseRetryDelay(body) {
+  const m = /"retryDelay"\s*:\s*"([\d.]+)s"/i.exec(String(body || ''));
+  if (m) return Math.round(Number(m[1]) * 1000);
+  const m2 = /retry in\s*(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i.exec(String(body || ''));
+  if (m2) {
+    const [, h, mi, s] = m2;
+    const ms = (Number(h || 0) * 3600 + Number(mi || 0) * 60 + Number(s || 0)) * 1000;
+    if (ms > 0) return ms;
+  }
+  return 0;
+}
+
+/** فترة توقف الموديل: 20 ثانية ×2 لكل فشل (بحد أقصى 15 دقيقة) */
+function coolSttModel(model, ms) {
+  const prev = geminiSttCool.get(model);
+  const fails = (prev?.fails || 0) + 1;
+  const wait = Math.min(15 * 60 * 1000, ms || 20 * 1000 * 2 ** (fails - 1));
+  geminiSttCool.set(model, { until: Date.now() + wait, fails });
+  return wait;
+}
+
+function resetSttModel(model) {
+  geminiSttCool.delete(model);
+}
 
 const STT_PROMPT_GEMINI = `أنت مفرّغ صوتي دقيق لمحادثة صوتية بالعامية الخليجية (سعودية).
 اكتب الكلام المنطوق حرفياً كما هو، مع علامات ترقيم بسيطة.
@@ -599,10 +672,7 @@ async function callGeminiStt(model, b64, withThinking, timeoutMs) {
 /** يفرّغ wav (16kHz mono) عبر Gemini — أدق للهجات من Whisper */
 async function transcribeGemini(wav) {
   if (!GEMINI_KEY) throw new Error('ما فيه مفتاح Gemini للتفريغ');
-  const models = GEMINI_STT_MODELS.filter((m) => {
-    const until = geminiSttCool.get(m) || 0;
-    return Date.now() >= until;
-  });
+  const models = GEMINI_STT_MODELS.filter(sttModelReady);
   if (!models.length) throw new Error('كل موديلات Gemini للتفريغ في فترة توقف');
 
   const b64 = wav.toString('base64');
@@ -613,16 +683,17 @@ async function transcribeGemini(wav) {
     try {
       const t0 = Date.now();
       let res = await callGeminiStt(model, b64, true, timeoutMs);
-      // لو الموديل ما يقبل إعداد التفكير نعيد بدونها
+      // الموديلات lite ترفض إعداد التفكير (400 invalid argument) → نعيد بدونه
       if (res.status === 400) {
-        const probe = await res.clone().text().catch(() => '');
-        if (/thinking/i.test(probe)) res = await callGeminiStt(model, b64, false, timeoutMs);
+        await res.text().catch(() => '');
+        res = await callGeminiStt(model, b64, false, timeoutMs);
       }
 
       if (!res.ok) {
         const txt = await res.text().catch(() => '');
-        const err = new Error(`Gemini STT ${res.status}: ${txt.slice(0, 160)}`);
+        const err = new Error(`Gemini STT ${res.status}: ${txt.slice(0, 400)}`);
         err.status = res.status;
+        err.body = txt;
         throw err;
       }
 
@@ -651,11 +722,11 @@ async function transcribeGemini(wav) {
       if (!parsed) {
         const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
         if (!cleaned) {
-          geminiSttCool.set(model, Date.now() + 60 * 1000);
+          coolSttModel(model, 60 * 1000);
           throw new Error('رد Gemini فاضي');
         }
         if (/^[{[]/.test(cleaned) || /"(transcript|unclear)"\s*:/.test(cleaned)) {
-          geminiSttCool.set(model, Date.now() + 2 * 60 * 1000);
+          coolSttModel(model, 2 * 60 * 1000);
           throw new Error(`رد Gemini مو JSON صالح: ${cleaned.slice(0, 60)}`);
         }
         text = cleaned;
@@ -664,10 +735,14 @@ async function transcribeGemini(wav) {
       // تعليقات وصفية بدل تفريغ (يصير لو المقطع همس/غير مفهوم)
       if (/التسجيل|المقطع الصوتي|لا أستطيع|لا استطيع|لا يمكنني تفريغ|لم أسمع/.test(text)) {
         log(`🙈 رد Gemini وصفي (مو تفريغ): "${text.slice(0, 70)}"`);
+        resetSttModel(model);
         return { text: '', junk: true, source: 'gemini', unclear: true };
       }
 
-      log(`🎧 تفريغ Gemini (${model}، ${Date.now() - t0}ms): "${text.slice(0, 80)}"${unclear ? ' [غير واضح]' : ''}`);
+      resetSttModel(model);
+      log(
+        `🎧 تفريغ Gemini (${model}، ${Date.now() - t0}ms): "${text.slice(0, 80)}"${unclear ? ' [غير واضح]' : ''}`,
+      );
       if (unclear || !text || isJunkTranscript(text)) {
         return { text: '', junk: true, source: 'gemini', unclear };
       }
@@ -675,9 +750,13 @@ async function transcribeGemini(wav) {
     } catch (e) {
       lastErr = e;
       const msg = String(e.message || e);
-      const quota = /\b429\b|quota|exceeded|RESOURCE_EXHAUSTED|rate.?limit/i.test(msg);
-      geminiSttCool.set(model, Date.now() + (quota ? 30 * 60 * 1000 : 2 * 60 * 1000));
-      log(`⚠️ فشل تفريغ Gemini (${model}): ${msg.slice(0, 110)}`);
+      const status = e.status || 0;
+      // 429/503 = حصة أو ضغط مؤقت → نرجع له بسرعة (retryDelay من جوجل أو 20s)
+      const hinted = parseRetryDelay(e.body || msg);
+      const wait = coolSttModel(model, hinted);
+      log(
+        `⚠️ فشل تفريغ Gemini (${model}، ${status || '-'}) — أوقفه ${Math.round(wait / 1000)} ثانية: ${msg.slice(0, 200)}`,
+      );
     }
   }
   throw lastErr || new Error('فشل تفريغ Gemini');

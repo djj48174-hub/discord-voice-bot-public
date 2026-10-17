@@ -101,7 +101,12 @@ function setContextProvider(fn) {
   contextProvider = typeof fn === 'function' ? fn : null;
 }
 
-function momentContext(userLabel) {
+/**
+ * معلومات اللحظة.
+ * @param {string} userLabel اسم اللي يتكلم
+ * @param {string} guildId السيرفر (عشان كل سيرفر يكون مستقل عن الثاني)
+ */
+function momentContext(userLabel, guildId) {
   const lines = [];
   try {
     const now = new Date();
@@ -120,7 +125,7 @@ function momentContext(userLabel) {
   }
   if (userLabel) lines.push(`- اللي يكلمك الآن: ${userLabel}`);
   try {
-    const extra = contextProvider ? contextProvider(userLabel) : '';
+    const extra = contextProvider ? contextProvider(userLabel, guildId) : '';
     if (extra) lines.push(String(extra).trim());
   } catch {
     /* تجاهل */
@@ -439,7 +444,7 @@ async function discoverGroq() {
 // المحرّك الموحّد
 // ---------------------------------------------------------------------------
 async function askAI(key, text, userLabel, opts = {}) {
-  const sys = (opts.systemPrompt || SYSTEM_PROMPT) + momentContext(userLabel);
+  const sys = (opts.systemPrompt || SYSTEM_PROMPT) + momentContext(userLabel, opts.guildId);
   const maxTokens = opts.maxOutputTokens || 800;
   await discoverGroq();
 
@@ -544,7 +549,7 @@ const VOICE_REPLY_MAX = Math.max(60, Number(process.env.VOICE_REPLY_MAX || 80));
 
 const VOICE_FALLBACK = 'حاضر، كيف أقدر أساعدك؟';
 
-async function voiceReply({ key, text, userLabel }) {
+async function voiceReply({ key, text, userLabel, guildId }) {
   const clean = String(text || '').trim();
   if (clean) remember(key, 'user', userLabel ? `${userLabel}: ${clean}` : clean);
   const prompt = clean || 'سلّم عليهم';
@@ -557,6 +562,7 @@ async function voiceReply({ key, text, userLabel }) {
     const out = await askAI(key, prompt, userLabel, {
       systemPrompt: VOICE_PROMPT,
       maxOutputTokens: 220,
+      guildId,
     });
     const clipped = clipSpeech(out, VOICE_REPLY_MAX);
     remember(key, 'model', clipped);
@@ -688,7 +694,7 @@ function localReply(key, text) {
 // ---------------------------------------------------------------------------
 // الواجهة الرئيسية
 // ---------------------------------------------------------------------------
-async function reply({ key, text, userLabel }) {
+async function reply({ key, text, userLabel, guildId }) {
   const clean = String(text || '').trim();
   // نخزّن اسم المتكلم مع كلامه عشان النموذج يعرف مين قال وش
   if (clean) remember(key, 'user', userLabel ? `${userLabel}: ${clean}` : clean);
@@ -713,7 +719,7 @@ async function reply({ key, text, userLabel }) {
   }
 
   try {
-    let out = await askAI(key, prompt, userLabel);
+    let out = await askAI(key, prompt, userLabel, { guildId });
 
     // لو الرد مكرر مثل اللي قبله -> نعيد التوليد مرة وحدة بزاوية ثانية
     const prev = [...historyFor(key)].reverse().find((m) => m.role === 'model')?.text;
@@ -724,6 +730,7 @@ async function reply({ key, text, userLabel }) {
           key,
           `${prompt}\n\n(لا تكرر أسلوبك السابق أبداً — جاوب من زاوية مختلفة، بافتتاحية جديدة وبكلمات مختلفة)`,
           userLabel,
+          { guildId },
         );
         if (again && !tooSimilar(again, prev)) out = again;
         else if (again) out = again;
@@ -812,7 +819,7 @@ async function handleInteraction(interaction) {
     await interaction.channel?.sendTyping?.().catch(() => {});
     const text = interaction.options.getString('الكلام');
     const who = interaction.member?.displayName || interaction.user.username;
-    const r = await reply({ key: historyKey(interaction), text, userLabel: who });
+    const r = await reply({ key: historyKey(interaction), text, userLabel: who, guildId: interaction.guildId });
     // نعرض كلام المستخدم فوق الرد عشان ما "يختفي"
     await interaction.editReply(`> 💬 **${who}:** ${clip(text, 350)}\n\n${r.text}`);
     return true;

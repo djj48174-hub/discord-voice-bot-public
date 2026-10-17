@@ -34,6 +34,30 @@ function log(...args) {
   console.log(`[${new Date().toISOString()}]`, '[music]', ...args);
 }
 
+/** كم حزمة صوت أرسلناها فعلاً لديسكورد على هذا الاتصال (تشخيص) */
+function countPlayedPackets(connection) {
+  try {
+    return Number(connection?.state?.connectionData?.packetsPlayed || 0);
+  } catch {
+    return 0;
+  }
+}
+
+/** إعدادات تصحيح الصوت (VOICE_DEBUG=true يطبع رسائل WS/UDP/DAVE) */
+const VOICE_DEBUG = String(process.env.VOICE_DEBUG || 'false').toLowerCase() === 'true';
+
+/** حلقة تخزين لآخر رسائل تصحيح الصوت — نعرضها عبر /diag بدون ما نفعّل طباعة دائمة */
+const debugRing = [];
+function pushVoiceDebug(msg) {
+  const line = `${new Date().toISOString()} ${String(msg).slice(0, 300)}`;
+  debugRing.push(line);
+  if (debugRing.length > 400) debugRing.shift();
+  if (VOICE_DEBUG) log('[صوت]', String(msg).slice(0, 220));
+}
+function getVoiceDebug(limit = 80) {
+  return debugRing.slice(-limit);
+}
+
 // ---------------------------------------------------------------------------
 // الأدوات (yt-dlp / ffmpeg)
 // ---------------------------------------------------------------------------
@@ -460,6 +484,7 @@ class GuildMusic {
     this.repeat = false;          // تكرار الأغنية الحالية
     this._suppressRepeat = false; // نتجاهل التكرار لما نتخطى أو نغيّر الصوت
     this._voicePaused = false;    // الموسيقى موقوفة مؤقتاً عشان البوت يرد صوتياً
+    this._voiceReplyActive = false; // speak() شغّال — امنع _onEnded من سرقة المشغّل
     this._didPlay = false;        // هل الأغنية الحالية اشتغلت فعلاً؟
     this._lastEndedAt = 0;
 
@@ -481,6 +506,9 @@ class GuildMusic {
 
   /** يننادى لما تخلص الأغنية (أو تفشل) */
   _onEnded() {
+    // أثناء الرد الصوتي: ما نلمس الطابور ولا نسرق المشغّل
+    if (this._voiceReplyActive || this._voicePaused) return;
+
     // حماية من الاستدعاء المزدوج (Idle + error)
     const now = Date.now();
     if (now - this._lastEndedAt < 300) return;
@@ -772,13 +800,15 @@ class GuildMusic {
   // -------------------------------------------------------------------------
   pauseForVoice() {
     this._voicePaused = true;
-    const st = this.player.state.status;
-    if (st === AudioPlayerStatus.Playing || st === AudioPlayerStatus.Paused) {
+    // مهم: ما نستخدم player.pause() — لو بقي Paused/AutoPaused
+    // الصوت ما ينرسل لديسكورد و speak() يعلّق بدون Idle.
+    if (this.currentStream) {
       try {
-        this.player.pause();
+        this.currentStream.kill();
       } catch {
         /* ignore */
       }
+      this.currentStream = null;
     }
   }
 
@@ -788,12 +818,8 @@ class GuildMusic {
     if (!this.current) return;
     // المورد الصوتي ما يرجع بعد الإيقاف — نعيد الأغنية من البداية
     this.songs.unshift(this.current);
+    this.current = null;
     this._suppressRepeat = true;
-    try {
-      this.player.stop(true);
-    } catch {
-      /* ignore */
-    }
     // نشغّل بدون انتظار — ما نبي نعلّق رد الصوت على يوتيوب المحجوب
     this.playNext().catch(() => {});
   }
@@ -803,33 +829,92 @@ class GuildMusic {
    */
   speak(oggBuffer, volume = 1) {
     this.pauseForVoice();
+    this._voiceReplyActive = true;
+    const savedSong = this.current;
+    const packetsBefore = countPlayedPackets(this.connection);
+
     return new Promise((resolve) => {
       let done = false;
-      const finish = (ok) => {
+      let sawPlaying = false;
+      let timer = null;
+
+      const finish = (ok, reason = '') => {
         if (done) return;
         done = true;
-        clearTimeout(timer);
-        this.player.off(AudioPlayerStatus.Idle, onIdle);
+        if (timer) clearTimeout(timer);
+        this.player.off('stateChange', onState);
+        this._voiceReplyActive = false;
+        const sent = countPlayedPackets(this.connection) - packetsBefore;
+        log(`📤 حزم الصوت المرسلة لديسكورد: ${sent}`);
+        if (reason) log(`🔊 نهاية النطق: ok=${ok} (${reason})`);
+        // رجّع الأغنية المحفوظة حتى لو _onEnded حاول يمسّحها
+        if (savedSong && !this.current) this.current = savedSong;
         this.resumeAfterVoice();
         resolve(ok);
       };
 
-      const onIdle = () => finish(true);
-      this.player.once(AudioPlayerStatus.Idle, onIdle);
-      const timer = setTimeout(() => finish(false), 90000);
+      const onState = (oldS, next) => {
+        const line = `${oldS.status} -> ${next.status}`;
+        log(`[speak] player: ${line}`);
+        if (next.status === AudioPlayerStatus.Playing) {
+          sawPlaying = true;
+          return;
+        }
+        if (next.status === AudioPlayerStatus.AutoPaused) {
+          // ضاع الاشتراك — نحاول نرجع ونكمّل
+          try {
+            if (this.connection) this.connection.subscribe(this.player);
+            this.player.unpause();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        if (next.status === AudioPlayerStatus.Paused) {
+          try {
+            this.player.unpause();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        if (next.status === AudioPlayerStatus.Idle) {
+          // Buffering->Idle = فكّ الـ Ogg فشل قبل ما يشتغل
+          if (!sawPlaying && oldS.status === AudioPlayerStatus.Buffering) {
+            return finish(false, 'buffering->idle');
+          }
+          return finish(sawPlaying, sawPlaying ? 'idle' : 'idle-without-playing');
+        }
+      };
+
+      this.player.on('stateChange', onState);
+      timer = setTimeout(() => finish(sawPlaying, 'timeout'), 45000);
 
       try {
-        // نفس طريقة الموسيقى بالضبط: PassThrough بدون inlineVolume
-        // (inlineVolume يفسد حزم Opus المشفّرة)
+        // تأكيد الاشتراك قبل التشغيل (بدون مشترك = صمت أو AutoPaused)
+        if (this.connection) {
+          try {
+            this.connection.subscribe(this.player);
+          } catch {
+            /* ignore */
+          }
+        }
+
+        // نفس طريقة الموسيقى: PassThrough + OggOpus (بدون inlineVolume)
         const pt = new PassThrough();
-        pt.end(oggBuffer);
+        pt.end(Buffer.from(oggBuffer));
         const resource = createAudioResource(pt, { inputType: StreamType.OggOpus });
-        if (volume !== 1) resource.volume.setVolume(volume);
         this.player.play(resource);
+        if (
+          this.player.state.status === AudioPlayerStatus.Paused ||
+          this.player.state.status === AudioPlayerStatus.AutoPaused
+        ) {
+          this.player.unpause();
+        }
         log(`🔊 نطقنا (${oggBuffer.length} بايت)`);
       } catch (e) {
         log('⚠️ فشل النطق:', e.message);
-        finish(false);
+        finish(false, e.message);
       }
     });
   }
@@ -895,7 +980,15 @@ function getOrCreateConnection(guild, channel) {
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: false,
       selfMute: false,
+      debug: true,
     });
+  }
+
+  // نجمع رسائل التصحيح (WS / UDP / DAVE) — نعرضها عبر /diag عند الحاجة
+  if (conn && !conn.__dbgBound) {
+    conn.__dbgBound = true;
+    conn.on('debug', pushVoiceDebug);
+    conn.on('stateChange', (o, n) => pushVoiceDebug(`state: ${o.status} -> ${n.status}`));
   }
 
   music.attach(conn);
@@ -1333,4 +1426,6 @@ module.exports = {
   ensureWorkingClient,
   getActiveClient: () => activeClient,
   createAudioStream,
+  getVoiceDebug,
+  countPlayedPackets,
 };

@@ -100,49 +100,155 @@ const healthServer = http.createServer(async (req, res) => {
 
       // تشغيل صوت تجريبي في الروم الصوتي (لتشخيص مشكلة عدم سماع الرد)
       if (u.searchParams.get('play') === '1') {
+        const send = (obj, code = 200) => {
+          res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(obj, null, 2));
+        };
+
         const g = (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();
-        if (!g) return { error: 'ما فيه سيرفر' };
+        if (!g) {
+          send({ error: 'ما فيه سيرفر' }, 404);
+          return;
+        }
 
         const conn = getVoiceConnection(g.id);
-        if (!conn) return { error: 'البوت مو في روم صوتي' };
+        if (!conn) {
+          send({ error: 'البوت مو في روم صوتي' }, 409);
+          return;
+        }
+        const packetsAtStart = music.countPlayedPackets(conn);
 
         const m = music.getQueue(g.id);
         const states = [];
+
+        // نحاول نلغي كتم/صمم السيرفر عن البوت نفسه (لو صار بالغلط)
+        let fixVoice = null;
+        const me0 = g.members?.me;
+        try {
+          if (me0?.voice?.deaf) {
+            await me0.voice.setDeaf(false, 'إصلاح تلقائي').then(
+              () => {
+                fixVoice = 'ألغيت صمم السيرفر';
+              },
+              (e) => {
+                fixVoice = `فشل إلغاء الصمم: ${String(e.message).slice(0, 90)}`;
+              },
+            );
+          } else if (me0?.voice?.mute) {
+            await me0.voice.setMute(false, 'إصلاح تلقائي').then(
+              () => {
+                fixVoice = 'ألغيت كتم السيرفر';
+              },
+              (e) => {
+                fixVoice = `فشل إلغاء الكتم: ${String(e.message).slice(0, 90)}`;
+              },
+            );
+          }
+        } catch (e) {
+          fixVoice = `خطأ: ${String(e.message).slice(0, 90)}`;
+        }
+
         const onState = (o, n) => {
           states.push(`${o.status} -> ${n.status}`);
           log(`[diag] player: ${o.status} -> ${n.status}`);
         };
         m.player.on('stateChange', onState);
 
-        const ogg = await speech.speak('هلا، هذا اختبار صوت من البوت. هل تسمعني؟');
+        // tone=1 يجبر نغمة محلية (يعزل مسار التشغيل عن Edge/Groq TTS)
+        const forceTone = u.searchParams.get('tone') === '1';
+        let ogg;
+        let source = 'tts';
+        if (forceTone) {
+          ogg = await speech.testTone(3, 440);
+          source = 'tone';
+        } else {
+          try {
+            ogg = await speech.speak('هلا، هذا اختبار صوت من البوت. هل تسمعني؟');
+          } catch (e) {
+            log('[diag] النطق فشل، نستخدم نغمة:', String(e.message).slice(0, 80));
+            ogg = await speech.testTone(3, 440);
+            source = 'tone';
+          }
+        }
+
+        // تأكيد ربط المشغّل قبل الاختبار
+        try {
+          music.attachPlayerToConnection(g.id, conn);
+        } catch {
+          /* ignore */
+        }
+
         const p = m.speak(ogg, 1).then(
           (v) => ({ ok: v }),
           (e) => ({ ok: false, error: String(e.message).slice(0, 120) }),
         );
 
-        // ننتظر بس 12 ثانية عشان ما نعلّق الطلب
-        await new Promise((r) => setTimeout(r, 12000));
-        const result = await Promise.race([p, Promise.resolve({ ok: null, note: 'لسا يشتغل' })]);
+        // ننتظر انتهاء النطق بحد أقصى 15 ثانية
+        const result = await Promise.race([
+          p,
+          new Promise((r) => setTimeout(() => r({ ok: null, note: 'لسا يشتغل بعد 15ث' }), 15000)),
+        ]);
 
         setTimeout(() => m.player.off('stateChange', onState), 2000);
 
         const me = g.members?.me;
         const voice = me?.voice;
-        return {
+        const ch = g.channels.cache.get(conn.joinConfig.channelId);
+        const cd = conn.state?.connectionData;
+        const dave = conn.state?.dave;
+        send({
           ...result,
           states,
           playerStatus: m.player.state.status,
+          subscribers: m.player.playable?.length ?? m.player.subscribers?.size ?? null,
+          connStatus: conn.state?.status ?? null,
           channelId: conn.joinConfig.channelId,
-          channelName: g.channels.cache.get(conn.joinConfig.channelId)?.name || null,
+          channelName: ch?.name || null,
           selfMute: conn.joinConfig.selfMute,
           selfDeaf: conn.joinConfig.selfDeaf,
           serverMute: voice?.mute ?? null,
           serverDeaf: voice?.deaf ?? null,
           suppress: voice?.suppress ?? null,
           speaking: voice?.speaking ?? null,
-          voiceChannelMembers: (g.channels.cache.get(conn.joinConfig.channelId)?.members?.size ?? 0),
+          voiceChannelMembers: ch?.members?.size ?? 0,
+          voiceChannelMemberNames: ch
+            ? [...ch.members.values()].map((mm) => mm.displayName || mm.user?.username)
+            : [],
+          // مؤشرات إرسال الصوت الفعلية
+          packetsPlayed: cd?.packetsPlayed ?? null,
+          packetsSentDuringTest: (cd?.packetsPlayed ?? 0) - packetsAtStart,
+          sequence: cd?.sequence ?? null,
+          timestamp: cd?.timestamp ?? null,
+          ssrc: cd?.ssrc ?? null,
+          encryptionMode: cd?.encryptionMode ?? null,
+          sentSpeaking: cd?.speaking ?? null,
+          daveProtocol: dave?.protocolVersion ?? null,
+          daveReady: dave?.session?.ready ?? null,
+          davePrivacyCode: (() => {
+            try {
+              return dave?.voicePrivacyCode ?? null;
+            } catch {
+              return 'err';
+            }
+          })(),
           audioBytes: ogg.length,
-        };
+          audioSource: source,
+          fixVoice,
+          voiceDebug: music.getVoiceDebug(60),
+          perms: (() => {
+            const p = me?.permissions;
+            if (!p) return null;
+            return {
+              admin: p.has('Administrator'),
+              deafenMembers: p.has('DeafenMembers'),
+              muteMembers: p.has('MuteMembers'),
+              connect: p.has('Connect'),
+              speak: p.has('Speak'),
+              prioritySpeaker: p.has('PrioritySpeaker'),
+            };
+          })(),
+        });
+        return;
       }
 
       const data = await music.diagnose({
@@ -181,6 +287,15 @@ const healthServer = http.createServer(async (req, res) => {
           : null,
         uptime: Math.round(process.uptime()),
         voiceChat: voiceChat ? voiceChat.stats : null,
+        voiceState: guild?.members?.me?.voice
+          ? {
+              mute: guild.members.me.voice.mute ?? null,
+              deaf: guild.members.me.voice.deaf ?? null,
+              selfMute: guild.members.me.voice.selfMute ?? null,
+              selfDeaf: guild.members.me.voice.selfDeaf ?? null,
+              suppress: guild.members.me.voice.suppress ?? null,
+            }
+          : null,
       }),
     );
   } else {
@@ -330,26 +445,8 @@ function connect(guild, channel) {
 
             const m = music.getQueue(guild.id);
             const stream = await speech.speak(reply.text);
-            await m.speak(stream, 1);
-            log(`🔊 نطقنا (${Date.now() - t0}ms)`);
-
-            // ننشر المحادثة في الشات النصي كمان عشان تكون ظاهرة
-            try {
-              const target =
-                guild.channels.cache.find(
-                  (c) =>
-                    c.isTextBased?.() &&
-                    c.isViewable?.() &&
-                    c.permissionsFor(guild.members.me)?.has('SendMessages'),
-                ) || guild.systemChannel;
-              if (target) {
-                await target.send(
-                  `🎤 **${name}:** ${text}\n🤖 **${BOT_NAME}:** ${reply.text}`,
-                );
-              }
-            } catch (e) {
-              log('⚠️ ما قدرت أنشر رد الصوت في الشات:', e.message.slice(0, 80));
-            }
+            const played = await m.speak(stream, 1);
+            log(`🔊 نطقنا (${Date.now() - t0}ms) — تشغيل=${played ? 'نجح' : 'ما وصل'}`);
           } catch (e) {
             log('⚠️ فشل الرد الصوتي:', String(e.message).slice(0, 150));
           } finally {
@@ -413,6 +510,12 @@ client.once('ready', async () => {
   // فحص مفتاح الذكاء الاصطناعي (لو موجود)
   chat.selfTest().catch((e) => log('تنبيه: فحص المحادثة فشل:', e.message));
 
+  // فحص محرّك النطق (يبيّن أي مزوّد يشتغل: Groq / Edge / Google)
+  speech
+    .speak('أنا جاهز أسمعك وأرد عليك')
+    .then((ogg) => log(`✅ محرّك النطق شغّال (${ogg.length} بايت)`))
+    .catch((e) => log('❌ محرّك النطق ما يشتغل:', String(e.message).slice(0, 160)));
+
   if (VOICE_CHANNEL_ID) {
     await ensureConnected();
   } else {
@@ -433,6 +536,15 @@ client.on('guildCreate', (guild) => {
 client.on('voiceStateUpdate', (oldState, newState) => {
   if (!client.user || newState.id !== client.user.id) return;
   if (!autoRejoin) return;
+
+  // أحد صمّم/كتم البوت على السيرفر -> نحاول نلغيها فوراً (تحتاج صلاحية Deafen Members)
+  if (newState.deaf || newState.mute) {
+    log(
+      `⚠️ البوت ${newState.deaf ? 'مصمّم (Deafened)' : 'مكتوم (Muted)'} على السيرفر — أحاول ألغيها تلقائياً.`,
+    );
+    if (newState.deaf) newState.setDeaf(false, 'إصلاح تلقائي').catch(() => {});
+    if (newState.mute) newState.setMute(false, 'إصلاح تلقائي').catch(() => {});
+  }
 
   // طلع من الروم (انفصل / طردوه)
   if (oldState.channelId && !newState.channelId) {

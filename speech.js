@@ -76,8 +76,11 @@ function streamToBuffer(stream) {
   });
 }
 
-/** WebM Opus (24kHz مونو من مايكروسوفت) -> Ogg Opus (48kHz ستيريو — ما يقبله ديسكورد) */
-function webmToOgg(webm) {
+/**
+ * أي صوت (mp3/webm/wav/ogg) -> Ogg Opus 48kHz ستيريو بنفس إعدادات نغمة الاختبار.
+ * نعيد الترميز دائماً (مو remux) عشان ديسكورد يسمع بوضوح.
+ */
+function toDiscordOgg(inputBuf) {
   return new Promise((resolve, reject) => {
     const ff = spawn(
       ffmpegPath(),
@@ -87,6 +90,8 @@ function webmToOgg(webm) {
         'error',
         '-i',
         'pipe:0',
+        '-af',
+        'aresample=48000,volume=2.5',
         '-c:a',
         'libopus',
         '-b:a',
@@ -95,6 +100,10 @@ function webmToOgg(webm) {
         '48000',
         '-ac',
         '2',
+        '-application',
+        'audio',
+        '-frame_duration',
+        '20',
         '-f',
         'ogg',
         'pipe:1',
@@ -120,39 +129,185 @@ function webmToOgg(webm) {
       resolve(buf);
     });
     ff.stdin.on('error', () => {});
-    ff.stdin.end(webm);
+    ff.stdin.end(inputBuf);
+  });
+}
+
+/** @deprecated استخدم toDiscordOgg */
+function webmToOgg(webm) {
+  return toDiscordOgg(webm);
+}
+
+/**
+ * نغمة اختبار (بدون إنترنت) — لتشخيص مسار التشغيل بشكل مستقل عن محرّكات النطق.
+ */
+function testTone(seconds = 3, freq = 440) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(
+      ffmpegPath(),
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        `sine=frequency=${freq}:duration=${seconds}`,
+        '-c:a',
+        'libopus',
+        '-b:a',
+        '96k',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
+        '-f',
+        'ogg',
+        'pipe:1',
+      ],
+      { windowsHide: true },
+    );
+    const out = [];
+    const err = [];
+    ff.stdout.on('data', (d) => out.push(d));
+    ff.stderr.on('data', (d) => err.push(d));
+    ff.on('error', reject);
+    ff.on('close', (code) => {
+      const buf = Buffer.concat(out);
+      if (code !== 0 || buf.length < 200) {
+        return reject(new Error(Buffer.concat(err).toString().trim().slice(0, 150) || 'فشل توليد النغمة'));
+      }
+      resolve(buf);
+    });
   });
 }
 
 /**
+ * صوت عربي مجاني احتياطي (Google Translate) — لما Edge TTS ينقطع.
+ */
+async function speakGoogle(text) {
+  const clean = String(text || '').trim();
+  if (!clean) throw new Error('ما فيه نص');
+  const url =
+    'https://translate.google.com/translate_tts?ie=UTF-8&tl=ar&client=tw-ob&q=' +
+    encodeURIComponent(clean);
+
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://translate.google.com/' },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`Google TTS ${res.status}`);
+  const mp3 = Buffer.from(await res.arrayBuffer());
+  if (mp3.length < 500) throw new Error('صوت فاضي من Google TTS');
+  return toDiscordOgg(mp3);
+}
+
+/**
+ * محرّك Edge TTS (أصوات مايكروسوفت العربية) — مجاني لكن يتقيّد (429).
+ */
+async function speakEdge(text, opts = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const tts = new MsEdgeTTS();
+      await tts.setMetadata(opts.voice || nextVoice(), OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+      const { audioStream } = await tts.toStream(text, { rate: opts.rate || TTS_RATE });
+
+      const mp3 = await streamToBuffer(audioStream);
+      if (mp3.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
+      return await toDiscordOgg(mp3);
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e.message || e);
+      log(`⚠️ محاولة Edge ${attempt + 1} فشلت: ${msg.slice(0, 90)}`);
+      // 429 = تقييد — ننتقل للاحتياطي بسرعة
+      if (/\b429\b|rate.?limit|throttl/i.test(msg)) break;
+      await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+    }
+  }
+  throw lastErr || new Error('فشل Edge TTS');
+}
+
+/**
  * يرجّع صوتاً (Ogg Opus 48kHz ستيريو) جاهزاً للتشغيل في ديسكورد مباشرة.
- * صوت Edge TTS عربي + سرعة أعلى شوي عشان ما يطوّل.
+ * الترتيب قابل للتغيير عبر TTS_ORDER (الافتراضي: Groq -> Edge -> Google)
  */
 async function speak(text, opts = {}) {
   const clean = String(text || '').trim();
   if (!clean) throw new Error('ما فيه نص للنطق');
 
+  const order = String(process.env.TTS_ORDER || 'groq,edge,google')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
   let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+
+  for (const provider of order) {
     try {
-      const tts = new MsEdgeTTS();
-      // نبدّل الصوت كل محاولة — التقييد (429) يكون على الصوت الحالي
-      await tts.setMetadata(opts.voice || nextVoice(), OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-      const { audioStream } = await tts.toStream(clean, { rate: opts.rate || TTS_RATE });
-
-      const webm = await streamToBuffer(audioStream);
-      if (webm.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
-
-      const ogg = await webmToOgg(webm);
-      log(`🔊 صوت جاهز: ${ogg.length} بايت`);
-      return ogg;
+      if (provider === 'groq') {
+        if (!GROQ_KEY) throw new Error('ما فيه مفتاح Groq للنطق');
+        const ogg = await speakGroq(clean, opts);
+        log(`🔊 صوت جاهز (Groq Orpheus): ${ogg.length} بايت`);
+        return ogg;
+      }
+      if (provider === 'edge') {
+        const ogg = await speakEdge(clean, opts);
+        log(`🔊 صوت جاهز (Edge): ${ogg.length} بايت`);
+        return ogg;
+      }
+      if (provider === 'google') {
+        const ogg = await speakGoogle(clean);
+        log(`🔊 صوت جاهز (Google): ${ogg.length} بايت`);
+        return ogg;
+      }
     } catch (e) {
       lastErr = e;
-      log(`⚠️ محاولة النطق ${attempt + 1} فشلت: ${String(e.message).slice(0, 90)}`);
-      await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+      const msg = String(e.message || e);
+      log(`⚠️ فشل النطق عبر ${provider}: ${msg.slice(0, 110)}`);
+      if (/requires terms acceptance|model_terms_required/i.test(msg)) {
+        log(
+          '👉 مطلوب موافقة شروط Groq مرة واحدة فقط (من حسابك): ' +
+            'https://console.groq.com/playground?model=canopylabs%2Forpheus-arabic-saudi',
+        );
+      }
     }
   }
+
   throw lastErr || new Error('فشل توليد الصوت');
+}
+
+/** نطق عربي سعودي عبر Groq (أصوات: abdullah, fahad, sultan, lulwa, noura, aisha) */
+const GROQ_TTS_VOICES = ['abdullah', 'fahad', 'sultan', 'lulwa', 'noura', 'aisha'];
+const GROQ_TTS_MODEL = (
+  process.env.GROQ_TTS_MODEL || 'canopylabs/orpheus-arabic-saudi'
+).trim();
+let groqVoiceCursor = 0;
+
+async function speakGroq(text, opts = {}) {
+  const voice = opts.groqVoice || GROQ_TTS_VOICES[groqVoiceCursor++ % GROQ_TTS_VOICES.length];
+  const res = await fetch('https://api.groq.com/openai/v1/audio/speech', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_KEY}` },
+    body: JSON.stringify({
+      model: GROQ_TTS_MODEL,
+      input: String(text).slice(0, 600),
+      voice,
+      response_format: 'wav',
+    }),
+    signal: AbortSignal.timeout(45000),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    const err = new Error(`Groq TTS ${res.status}: ${txt.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  const wav = Buffer.from(await res.arrayBuffer());
+  if (wav.length < 500) throw new Error('صوت فاضي من Groq TTS');
+  return toDiscordOgg(wav);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,4 +453,4 @@ async function selfTest() {
   return out;
 }
 
-module.exports = { speak, transcribe, selfTest, nextVoice, ffmpegPath, oggToWav };
+module.exports = { speak, transcribe, selfTest, nextVoice, ffmpegPath, oggToWav, testTone, speakGoogle, toDiscordOgg };

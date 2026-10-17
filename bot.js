@@ -40,6 +40,7 @@ const TOKEN = (process.env.DISCORD_TOKEN || '').trim();
 const GUILD_ID = (process.env.GUILD_ID || '').trim();
 const VOICE_CHANNEL_ID = (process.env.VOICE_CHANNEL_ID || '').trim();
 const CHECK_MS = Math.max(5, Number(process.env.CHECK_SECONDS || 30)) * 1000;
+let memTick = 0;
 const LOCK_TO_CHANNEL = String(process.env.LOCK_TO_CHANNEL || 'true').toLowerCase() !== 'false';
 // ترحيب صوتي عند دخول أول شخص للروم (يشتغل كفحص تلقائي للنطق)
 const GREET_ON_JOIN = String(process.env.VOICE_GREET_ON_JOIN || 'true').toLowerCase() !== 'false';
@@ -61,7 +62,7 @@ let lastSpokenText = ''; // آخر شي نطقه البوت (نكشف صدى ص�
 let voiceChatOn = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
 
 // مهلة السماح لمحاولة الاتصال قبل ما نعتبرها فاشلة ونعيدها
-const JOIN_GRACE_MS = 20000;
+const JOIN_GRACE_MS = 8000;
 
 // ---------------------------------------------------------------------------
 // سجل بسيط
@@ -660,16 +661,32 @@ function connect(guild, channel) {
   conn.on(VoiceConnectionStatus.Disconnected, async () => {
     log('⚠️ انقطع الاتصال الصوتي — أحاول أرجع...');
     try {
-      // احتمال أنه ينقل لسيرفر صوتي جديد (إعادة اتصال طبيعية)
+      // احتمال أنه ينقل لسيرفر صوتي جديد (إعادة اتصال طبيعية) — نعطيه فرصة قصيرة فقط
       await Promise.race([
-        entersState(conn, VoiceConnectionStatus.Signalling, 5000),
-        entersState(conn, VoiceConnectionStatus.Connecting, 5000),
+        entersState(conn, VoiceConnectionStatus.Signalling, 2500),
+        entersState(conn, VoiceConnectionStatus.Connecting, 2500),
+        entersState(conn, VoiceConnectionStatus.Ready, 2500),
       ]);
       log('...يعيد الاتصال حالياً.');
     } catch {
-      // انقطاع حقيقي -> نتخلص وندخل من جديد
-      try { conn.destroy(); } catch {}
-      scheduleJoin(3000);
+      // انقطاع حقيقي (أو طرد/نقل) -> نتخلص وندخل من جديد بسرعة
+      log('↩️ ما رجع بسرعة — ندخل الروم من جديد فوراً.');
+      try {
+        conn.destroy();
+      } catch {
+        /* ignore */
+      }
+      lastJoinAt = 0;
+      scheduleJoin(800);
+    }
+  });
+
+  // شبكة أمان: لو صار الاتصال Destroyed لأي سبب بدون حدث disconnect
+  conn.on('stateChange', (oldS, newS) => {
+    if (newS.status === VoiceConnectionStatus.Destroyed && autoRejoin && VOICE_CHANNEL_ID) {
+      log(`♻️ الاتصال انتهى (${oldS.status} → destroyed) — أعيد الدخول.`);
+      lastJoinAt = 0;
+      scheduleJoin(1200);
     }
   });
 
@@ -729,6 +746,34 @@ client.once('ready', async () => {
 
   // فحص مفتاح الذكاء الاصطناعي (لو موجود)
   chat.selfTest().catch((e) => log('تنبيه: فحص المحادثة فشل:', e.message));
+
+  // معلومات اللحظة للذكاء الاصطناعي: الروم، الأغنية الشغالة، حالة السوالف الصوتية
+  chat.setContextProvider(() => {
+    const out = [];
+    try {
+      const g = (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();
+      const ch = g?.members?.me?.voice?.channel;
+      if (ch) {
+        const n = Math.max(0, (ch.members?.size || 1) - 1);
+        out.push(`- انت الآن في الروم الصوتي «${ch.name}» معك ${n} ${n === 1 ? 'شخص' : 'أشخاص'}`);
+      } else {
+        out.push('- انت مو داخل أي روم صوتي حالياً');
+      }
+      if (voiceChat) {
+        out.push(`- السوالف الصوتية: ${voiceChatOn ? 'مشغّلة (تسمع وترد بالصوت)' : 'موقفة (تشتغل بأمر صوتي)'}`);
+      }
+      const q = g ? music.getQueue(g.id) : null;
+      if (q?.current?.title) {
+        out.push(`- الأغنية اللي تشتغل الآن: «${q.current.title}»`);
+        if (q.songs?.length) out.push(`- بعدها في الطابور ${q.songs.length} أغنية`);
+      } else {
+        out.push('- ما فيه شي يشتغل الآن');
+      }
+    } catch {
+      /* تجاهل */
+    }
+    return out.join('\n');
+  });
 
   // فحص محرّك النطق (يبيّن أي مزوّد يشتغل: Groq / Edge / Google)
   speech
@@ -1748,6 +1793,21 @@ client.on('interactionCreate', async (interaction) => {
 // ---------------------------------------------------------------------------
 setInterval(() => {
   ensureConnected().catch((e) => log('خطأ في الفحص الدوري:', e.message));
+
+  // مراقبة الذاكرة (كل دقيقتين) — تكشف التسريب/الحدود قبل ما يقتلنا المستضيف
+  try {
+    const mb = (n) => Math.round(n / 1048576);
+    const m = process.memoryUsage();
+    memTick++;
+    if (memTick % 4 === 1) {
+      log(
+        `🧠 الذاكرة: ${mb(m.rss)}MB (heap ${mb(m.heapUsed)}/${mb(m.heapTotal)}، خارجي ${mb(m.external)}) | شغّال منذ ${Math.round(process.uptime() / 60)} دقيقة`,
+      );
+    }
+    if (memTick % 20 === 0 && typeof global.gc === 'function') global.gc();
+  } catch {
+    /* ignore */
+  }
 
   // فحص اتصال البوابة (لو تعطّل، ما بنستقبل أوامر)
   try {

@@ -16,7 +16,7 @@ function log(...args) {
 }
 
 // كم ننتظر صمت قبل ما نعتبر المقطع انتهى (أعلى = ما نقطع كلامك بالنص)
-const SILENCE_MS = Math.max(300, Number(process.env.VOICE_SILENCE_MS || 1100));
+const SILENCE_MS = Math.max(300, Number(process.env.VOICE_SILENCE_MS || 900));
 // أقصى طول للمقطع الواحد (نقطعه لو المستخدم طول)
 const MAX_UTTERANCE_MS = Math.max(2000, Number(process.env.VOICE_MAX_MS || 15000));
 // أقل طول مقطع نعتبره كلام (نمنع النقرات والضجيج)

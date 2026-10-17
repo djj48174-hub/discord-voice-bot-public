@@ -736,8 +736,8 @@ async function transcribeGemini(wav, opts = {}) {
 
   const b64 = wav.toString('base64');
   // مهم للسرعة: الموديل اللي يبطي نحرمه بسرعة ونروح للي بعده
-  const perModelMs = Number(process.env.STT_MODEL_TIMEOUT_MS || opts.perModelMs || 6000);
-  const budgetMs = Number(process.env.STT_BUDGET_MS || opts.budgetMs || 12000);
+  const perModelMs = Number(process.env.STT_MODEL_TIMEOUT_MS || opts.perModelMs || 5500);
+  const budgetMs = Number(process.env.STT_BUDGET_MS || opts.budgetMs || 10000);
   const start = Date.now();
   let lastErr = null;
 
@@ -834,9 +834,21 @@ async function benchStt({ models = GEMINI_STT_MODELS, caps = 2, perModelMs = 120
         row.ms = Date.now() - t0;
         row.status = res.status;
         if (res.ok) {
-          const p = parseGeminiTranscript(body);
+          // ملاحظة: body هو غلاف الرد كامل — لازم نفكّ parts قبل التحليل
+          let inner = body;
+          try {
+            const jj = JSON.parse(body);
+            inner = (jj?.candidates?.[0]?.content?.parts || [])
+              .map((p) => p.text)
+              .filter(Boolean)
+              .join('');
+          } catch {
+            /* خلّه كما هو */
+          }
+          const p = parseGeminiTranscript(inner);
           row.text = p.text.slice(0, 60);
           row.unclear = p.unclear;
+          if (!row.text) row.raw = String(inner).replace(/\s+/g, ' ').slice(0, 120);
         } else {
           row.error = body.replace(/\s+/g, ' ').slice(0, 110);
         }

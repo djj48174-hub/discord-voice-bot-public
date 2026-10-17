@@ -203,11 +203,14 @@ function parseRetryMs(text) {
 
 function handleErr(id, e) {
   if (e.status === 429) {
-    const hinted = Number(e.retryMs) > 0 ? Number(e.retryMs) : parseRetryMs(e.body || '');
-    const ms = hinted || 10 * 60 * 1000; // افتراضي: 10 دقايق
+    const body = String(e.body || '');
+    const daily = /PerDay|per day|daily/i.test(body);
+    const hinted = Number(e.retryMs) > 0 ? Number(e.retryMs) : parseRetryMs(body);
+    // حصص جوجل أغلبها "لكل دقيقة" → نستبعد دقيقة ونرجع بسرعة (كان ١٠ دقايق = بطء)
+    const ms = hinted || (daily ? 60 * 60 * 1000 : 60 * 1000);
     exhaustedUntil.set(id, Date.now() + ms);
     const mins = Math.max(1, Math.round(ms / 60000));
-    log(`⏳ ${id}: خلصت الحصة — نستبعدها ${mins} دقيقة ونكمل على غيرها`);
+    log(`⏳ ${id}: خلصت الحصة (${daily ? 'يومية' : 'مؤقتة'}) — نستبعدها ${mins} دقيقة`);
   } else {
     log(`↩️ ${id}: ${String(e.message).slice(0, 80)}`);
   }
@@ -216,10 +219,22 @@ function handleErr(id, e) {
 // ---------------------------------------------------------------------------
 // Gemini
 // ---------------------------------------------------------------------------
-async function callGemini(model, body) {
+// أكثر من مفتاح = حصة أوسع (ونبدّل عند التقييد)
+const GEMINI_KEYS = [
+  GEMINI_KEY,
+  process.env.GEMINI_API_KEY2,
+  process.env.GEMINI_KEY2,
+  ...(process.env.GEMINI_API_KEYS || '').split(','),
+]
+  .map((k) => String(k || '').trim())
+  .filter(Boolean)
+  .filter((k, i, a) => a.indexOf(k) === i);
+
+async function callGemini(model, body, keyIndex = 0) {
+  const key = GEMINI_KEYS[keyIndex] || GEMINI_KEYS[0];
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
-    `:generateContent?key=${encodeURIComponent(GEMINI_KEY)}`;
+    `:generateContent?key=${encodeURIComponent(key)}`;
 
   await pace();
   const res = await fetch(url, {
@@ -234,6 +249,7 @@ async function callGemini(model, body) {
     const err = new Error(`Gemini ${res.status}: ${txt.slice(0, 300)}`);
     err.status = res.status;
     err.body = txt;
+    err.keyIndex = keyIndex;
     throw err;
   }
 
@@ -249,16 +265,25 @@ async function callGemini(model, body) {
   return text;
 }
 
-/** يجرّب موديل جمني بأكثر من شكل للطلب (التفكير قد يكون غير مدعوم) */
+/** يجرّب موديل جمني بأكثر من شكل للطلب (التفكير قد يكون غير مدعوم) وبكل المفاتيح */
 async function tryGeminiModel(model, bodies) {
   let lastErr = null;
   for (const body of bodies) {
-    try {
-      return await callGemini(model, body);
-    } catch (e) {
-      lastErr = e;
-      if (e.status === 400) continue; // شكل الطلب غير مدعوم -> جرّب اللي بعده
-      throw e;
+    for (let ki = 0; ki < Math.max(1, GEMINI_KEYS.length); ki++) {
+      const id = `gemini:${ki}:${model}`;
+      if (GEMINI_KEYS.length > 1 && isExhausted(id)) continue;
+      try {
+        return await callGemini(model, body, ki);
+      } catch (e) {
+        lastErr = e;
+        if (e.status === 400) break; // شكل الطلب غير مدعوم -> جرّب الشكل اللي بعده
+        if (e.status === 429 && GEMINI_KEYS.length > 1) {
+          // مفتاح مقفول؟ نجرّب المفتاح الثاني على نفس الموديل قبل ما نغيّر الموديل
+          handleErr(id, e);
+          continue;
+        }
+        throw e;
+      }
     }
   }
   throw lastErr;

@@ -111,6 +111,7 @@ const healthServer = http.createServer(async (req, res) => {
         const rows = await speech.benchStt({
           models: modelsParam.length ? modelsParam : undefined,
           caps,
+          keys: Number(u.searchParams.get('keys') || 0),
           perModelMs: Number(u.searchParams.get('timeout') || 12000),
         });
         log(`[diag] قياس التفريغ: ${rows.length} نتيجة`);

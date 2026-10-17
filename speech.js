@@ -610,6 +610,17 @@ function captureDebug(withAudio = false) {
 //   Whisper سمع: "طلّا جوع بروح أكله"  |  Gemini سمع: "والله جوعان بروح آكل" ✅
 // ---------------------------------------------------------------------------
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
+// أكثر من مفتاح = حصة أوسع (كل مفتاح مشروع مستقل) ونتنقّل بينها عند التقييد
+const GEMINI_KEYS = [
+  GEMINI_KEY,
+  process.env.GEMINI_API_KEY2,
+  process.env.GEMINI_KEY2,
+  ...(process.env.GEMINI_API_KEYS || '').split(','),
+]
+  .map((k) => String(k || '').trim())
+  .filter(Boolean)
+  .filter((k, i, a) => a.indexOf(k) === i);
+
 const GEMINI_STT_MODELS = (
   process.env.GEMINI_STT_MODELS ||
   // الترتيب مجرّب على تسجيلات المستخدم الحقيقية (1.5s مقطع همس — أصعب حالة):
@@ -625,13 +636,35 @@ const GEMINI_STT_MODELS = (
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-// model -> { until, fails }  — فترة توقف تتضاعف مع تكرار الفشل (429 حصة → نرجع بسرعة)
+// "<فهرس المفتاح>|<الموديل>" -> { until, fails }  (و -1|الموديل = الموديل نفسه بطيء)
 const geminiSttCool = new Map();
 
-function sttModelReady(m) {
-  const c = geminiSttCool.get(m);
-  return !c || Date.now() >= c.until;
+function sttCoolKey(ki, model) {
+  return `${ki}|${model}`;
 }
+
+/** هل الموديل جاهز بهذا المفتاح؟ (يوقف المفتاح+الموديل، أو الموديل كله لو بطيء) */
+function sttModelReady(ki, model) {
+  const c = geminiSttCool.get(sttCoolKey(ki, model));
+  if (c && Date.now() < c.until) return false;
+  const m = geminiSttCool.get(sttCoolKey(-1, model));
+  return !m || Date.now() >= m.until;
+}
+
+function sttModelReadyAnyKey(model) {
+  for (let k = 0; k < Math.max(1, GEMINI_KEYS.length); k++) {
+    if (sttModelReady(k, model)) return true;
+  }
+  return false;
+}
+
+/** هل الخطأ \"حصة يومية\" (ما ينفع معها أي محاولة اليوم)؟ */
+function sttDailyQuota(body) {
+  return /PerDay|per day|daily/i.test(String(body || ''));
+}
+
+const isTimeoutErr = (e) =>
+  e?.name === 'TimeoutError' || e?.name === 'AbortError' || /aborted|timeout/i.test(String(e?.message || ''));
 
 /** يستخرج "retryDelay": "7s" من رد جوجل */
 function parseRetryDelay(body) {
@@ -646,17 +679,19 @@ function parseRetryDelay(body) {
   return 0;
 }
 
-/** فترة توقف الموديل: 20 ثانية ×2 لكل فشل (بحد أقصى 15 دقيقة) */
-function coolSttModel(model, ms) {
-  const prev = geminiSttCool.get(model);
+/** فترة توقف: 20 ثانية ×2 لكل فشل متكرر (بحد أقصى 15 دقيقة) */
+function coolSttModel(ki, model, ms) {
+  const k = sttCoolKey(ki, model);
+  const prev = geminiSttCool.get(k);
   const fails = (prev?.fails || 0) + 1;
   const wait = Math.min(15 * 60 * 1000, ms || 20 * 1000 * 2 ** (fails - 1));
-  geminiSttCool.set(model, { until: Date.now() + wait, fails });
+  geminiSttCool.set(k, { until: Date.now() + wait, fails });
   return wait;
 }
 
-function resetSttModel(model) {
-  geminiSttCool.delete(model);
+function resetSttModel(ki, model) {
+  geminiSttCool.delete(sttCoolKey(ki, model));
+  geminiSttCool.delete(sttCoolKey(-1, model));
 }
 
 const STT_PROMPT_GEMINI = `أنت مفرّغ صوتي دقيق لمحادثة صوتية بالعامية الخليجية (سعودية).
@@ -694,10 +729,11 @@ function geminiSttConfig(withThinking) {
   return cfg;
 }
 
-async function callGeminiStt(model, b64, withThinking, timeoutMs) {
+async function callGeminiStt(model, b64, withThinking, timeoutMs, keyIndex = 0) {
+  const key = GEMINI_KEYS[keyIndex] || GEMINI_KEYS[0];
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
-    `:generateContent?key=${encodeURIComponent(GEMINI_KEY)}`;
+    `:generateContent?key=${encodeURIComponent(key)}`;
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -730,133 +766,162 @@ function parseGeminiTranscript(raw) {
 
 /** يفرّغ wav (16kHz mono) عبر Gemini — أدق للهجات من Whisper */
 async function transcribeGemini(wav, opts = {}) {
-  if (!GEMINI_KEY) throw new Error('ما فيه مفتاح Gemini للتفريغ');
-  const models = GEMINI_STT_MODELS.filter(sttModelReady);
-  if (!models.length) throw new Error('كل موديلات Gemini للتفريغ في فترة توقف');
+  if (!GEMINI_KEYS.length) throw new Error('ما فيه مفتاح Gemini للتفريغ');
+  const keyCount = Math.max(1, GEMINI_KEYS.length);
 
   const b64 = wav.toString('base64');
   // مهم للسرعة: الموديل اللي يبطي نحرمه بسرعة ونروح للي بعده
-  const perModelMs = Number(process.env.STT_MODEL_TIMEOUT_MS || opts.perModelMs || 5500);
-  const budgetMs = Number(process.env.STT_BUDGET_MS || opts.budgetMs || 10000);
+  const perModelMs = Number(process.env.STT_MODEL_TIMEOUT_MS || opts.perModelMs || 4500);
+  const budgetMs = Number(process.env.STT_BUDGET_MS || opts.budgetMs || 8000);
   const start = Date.now();
   let lastErr = null;
+  let tried = 0;
 
-  for (const model of models) {
-    const left = budgetMs - (Date.now() - start);
-    if (left < 800) {
-      log(`⏳ خلص وقت التفريغ (${budgetMs}ms) — ما أكمل باقي الموديلات`);
-      break;
-    }
-    try {
-      const t0 = Date.now();
-      const timeoutMs = Math.min(perModelMs, left);
-      let res = await callGeminiStt(model, b64, true, timeoutMs);
-      // الموديلات lite ترفض إعداد التفكير (400 invalid argument) → نعيد بدونه
-      if (res.status === 400) {
-        await res.text().catch(() => '');
-        res = await callGeminiStt(model, b64, false, Math.min(perModelMs, budgetMs - (Date.now() - start)));
+  for (const model of GEMINI_STT_MODELS) {
+    if (!sttModelReadyAnyKey(model)) continue;
+    for (let ki = 0; ki < keyCount; ki++) {
+      if (!sttModelReady(ki, model)) continue;
+      const left = budgetMs - (Date.now() - start);
+      if (left < 800) {
+        log(`⏳ خلص وقت التفريغ (${budgetMs}ms) — توقفت`);
+        if (tried) throw lastErr || new Error('فشل تفريغ Gemini');
+        // ما جرّبنا شي بعد (كل الموديلات موقوفة) → نروح للاحتياطي
+        throw new Error('كل موديلات Gemini في فترة توقف');
       }
+      const tag = keyCount > 1 ? `${model}#${ki + 1}` : model;
+      tried++;
+      try {
+        const t0 = Date.now();
+        const timeoutMs = Math.min(perModelMs, left);
+        let res = await callGeminiStt(model, b64, true, timeoutMs, ki);
+        // الموديلات lite ترفض إعداد التفكير (400 invalid argument) → نعيد بدونه
+        if (res.status === 400) {
+          await res.text().catch(() => '');
+          res = await callGeminiStt(
+            model,
+            b64,
+            false,
+            Math.min(perModelMs, Math.max(800, budgetMs - (Date.now() - start))),
+            ki,
+          );
+        }
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => '');
-        const err = new Error(`Gemini STT ${res.status}: ${txt.slice(0, 400)}`);
-        err.status = res.status;
-        err.body = txt;
-        throw err;
+        if (!res.ok) {
+          const txt = await res.text().catch(() => '');
+          const err = new Error(`Gemini STT ${res.status}: ${txt.slice(0, 400)}`);
+          err.status = res.status;
+          err.body = txt;
+          throw err;
+        }
+
+        const data = await res.json();
+        const raw = (data?.candidates?.[0]?.content?.parts || [])
+          .map((p) => p.text)
+          .filter(Boolean)
+          .join('')
+          .trim();
+
+        const parsed = parseGeminiTranscript(raw);
+        const { text, unclear } = parsed;
+
+        // رد مقطوع/غير صالح (يصير مع الموديلات التجريبية) → نجرّب الموديل التالي
+        if (parsed.bad) {
+          coolSttModel(ki, model, 2 * 60 * 1000);
+          throw new Error(`رد Gemini مو JSON صالح: ${String(raw).slice(0, 60)}`);
+        }
+
+        // تعليقات وصفية بدل تفريغ (يصير لو المقطع همس/غير مفهوم)
+        if (/التسجيل|المقطع الصوتي|لا أستطيع|لا استطيع|لا يمكنني تفريغ|لم أسمع/.test(text)) {
+          log(`🙈 رد Gemini وصفي (مو تفريغ): "${text.slice(0, 70)}"`);
+          resetSttModel(ki, model);
+          return { text: '', junk: true, source: 'gemini', unclear: true };
+        }
+
+        resetSttModel(ki, model);
+        log(
+          `🎧 تفريغ Gemini (${tag}، ${Date.now() - t0}ms): "${text.slice(0, 80)}"${unclear ? ' [غير واضح]' : ''}`,
+        );
+        if (unclear || !text || isJunkTranscript(text)) {
+          return { text: '', junk: true, source: 'gemini', unclear };
+        }
+        return { text, source: 'gemini', model };
+      } catch (e) {
+        lastErr = e;
+        const msg = String(e.message || e);
+        const status = e.status || 0;
+        if (isTimeoutErr(e)) {
+          // الموديل نفسه بطيء (مو المفتاح) → أوقفه كله 45 ثانية وروح للي بعده
+          const wait = coolSttModel(-1, model, 45 * 1000);
+          log(`🐌 تفريغ Gemini (${tag}) تعدّى ${Math.round(perModelMs)}ms — أوقفته ${Math.round(wait / 1000)} ثانية`);
+          break; // للموديل التالي
+        }
+        const daily = sttDailyQuota(e.body || msg);
+        // حصة يومية للمفتاح+الموديل → ٣٠ دقيقة (ما ينفع نلح)، وإلا ٢٠ ثانية ×2
+        const hinted = daily ? 30 * 60 * 1000 : parseRetryDelay(e.body || msg);
+        const wait = coolSttModel(ki, model, hinted);
+        log(
+          `⚠️ فشل تفريغ Gemini (${tag}، ${status || '-'}، ${Date.now() - start}ms) — أوقفته ${
+            daily ? 'حصة يومية' : Math.round(wait / 1000) + ' ثانية'
+          }: ${msg.slice(0, 140)}`,
+        );
+        if (status === 400) break; // مشكلة في الطلب نفسه → للموديل التالي
+        // 429 بس مؤقت؟ نكمل على المفتاح الثاني (جرّبنا أقل من كل المفاتيح)
+        continue;
       }
-
-      const data = await res.json();
-      const raw = (data?.candidates?.[0]?.content?.parts || [])
-        .map((p) => p.text)
-        .filter(Boolean)
-        .join('')
-        .trim();
-
-      const parsed = parseGeminiTranscript(raw);
-      let { text, unclear } = parsed;
-
-      // رد مقطوع/غير صالح (يصير مع الموديلات التجريبية) → نجرّب الموديل التالي
-      if (parsed.bad) {
-        coolSttModel(model, 2 * 60 * 1000);
-        throw new Error(`رد Gemini مو JSON صالح: ${String(raw).slice(0, 60)}`);
-      }
-
-      // تعليقات وصفية بدل تفريغ (يصير لو المقطع همس/غير مفهوم)
-      if (/التسجيل|المقطع الصوتي|لا أستطيع|لا استطيع|لا يمكنني تفريغ|لم أسمع/.test(text)) {
-        log(`🙈 رد Gemini وصفي (مو تفريغ): "${text.slice(0, 70)}"`);
-        resetSttModel(model);
-        return { text: '', junk: true, source: 'gemini', unclear: true };
-      }
-
-      resetSttModel(model);
-      log(
-        `🎧 تفريغ Gemini (${model}، ${Date.now() - t0}ms): "${text.slice(0, 80)}"${unclear ? ' [غير واضح]' : ''}`,
-      );
-      if (unclear || !text || isJunkTranscript(text)) {
-        return { text: '', junk: true, source: 'gemini', unclear };
-      }
-      return { text, source: 'gemini', model };
-    } catch (e) {
-      lastErr = e;
-      const msg = String(e.message || e);
-      const status = e.status || 0;
-      // 429/503 = حصة أو ضغط مؤقت → نرجع له بسرعة (retryDelay من جوجل أو 20s)
-      const hinted = parseRetryDelay(e.body || msg);
-      const wait = coolSttModel(model, hinted);
-      log(
-        `⚠️ فشل تفريغ Gemini (${model}، ${status || '-'}، ${Date.now() - start}ms) — أوقفه ${Math.round(wait / 1000)} ثانية: ${msg.slice(0, 160)}`,
-      );
     }
   }
   throw lastErr || new Error('فشل تفريغ Gemini');
 }
 
 /** قياس أداء التفريغ لكل موديل على مقاطع حقيقية محفوظة (للتشخيص من داخل السيرفر) */
-async function benchStt({ models = GEMINI_STT_MODELS, caps = 2, perModelMs = 12000 } = {}) {
+async function benchStt({ models = GEMINI_STT_MODELS, caps = 2, perModelMs = 12000, keys = 0 } = {}) {
   const list = captures.filter((c) => c.wav).slice(-Math.max(1, Math.min(5, caps)));
   const out = [];
+  const keyCount = keys > 0 ? Math.min(keys, Math.max(1, GEMINI_KEYS.length)) : 1;
   for (const model of models) {
     for (let i = 0; i < list.length; i++) {
       const c = list[i];
       const b64 = c.wav.toString('base64');
-      const t0 = Date.now();
-      const row = { model, cap: i + 1, seconds: Number(c.seconds?.toFixed?.(1) || 0) };
-      try {
-        let res = await callGeminiStt(model, b64, true, perModelMs);
-        let body = await res.text();
-        if (res.status === 400) {
-          row.thinking400 = true;
-          const t1 = Date.now();
-          res = await callGeminiStt(model, b64, false, perModelMs);
-          body = await res.text();
-          row.msNoThink = Date.now() - t1;
-        }
-        row.ms = Date.now() - t0;
-        row.status = res.status;
-        if (res.ok) {
-          // ملاحظة: body هو غلاف الرد كامل — لازم نفكّ parts قبل التحليل
-          let inner = body;
-          try {
-            const jj = JSON.parse(body);
-            inner = (jj?.candidates?.[0]?.content?.parts || [])
-              .map((p) => p.text)
-              .filter(Boolean)
-              .join('');
-          } catch {
-            /* خلّه كما هو */
+      for (let ki = 0; ki < keyCount; ki++) {
+        const t0 = Date.now();
+        const row = { model, key: ki + 1, cap: i + 1, seconds: Number(c.seconds?.toFixed?.(1) || 0) };
+        try {
+          let res = await callGeminiStt(model, b64, true, perModelMs, ki);
+          let body = await res.text();
+          if (res.status === 400) {
+            row.thinking400 = true;
+            const t1 = Date.now();
+            res = await callGeminiStt(model, b64, false, perModelMs, ki);
+            body = await res.text();
+            row.msNoThink = Date.now() - t1;
           }
-          const p = parseGeminiTranscript(inner);
-          row.text = p.text.slice(0, 60);
-          row.unclear = p.unclear;
-          if (!row.text) row.raw = String(inner).replace(/\s+/g, ' ').slice(0, 120);
-        } else {
-          row.error = body.replace(/\s+/g, ' ').slice(0, 110);
+          row.ms = Date.now() - t0;
+          row.status = res.status;
+          if (res.ok) {
+            // ملاحظة: body هو غلاف الرد كامل — لازم نفكّ parts قبل التحليل
+            let inner = body;
+            try {
+              const jj = JSON.parse(body);
+              inner = (jj?.candidates?.[0]?.content?.parts || [])
+                .map((p) => p.text)
+                .filter(Boolean)
+                .join('');
+            } catch {
+              /* خلّه كما هو */
+            }
+            const p = parseGeminiTranscript(inner);
+            row.text = p.text.slice(0, 60);
+            row.unclear = p.unclear;
+            if (!row.text) row.raw = String(inner).replace(/\s+/g, ' ').slice(0, 120);
+          } else {
+            row.error = body.replace(/\s+/g, ' ').slice(0, 110);
+          }
+        } catch (e) {
+          row.ms = Date.now() - t0;
+          row.error = String(e.message || e).replace(/\s+/g, ' ').slice(0, 110);
         }
-      } catch (e) {
-        row.ms = Date.now() - t0;
-        row.error = String(e.message || e).replace(/\s+/g, ' ').slice(0, 110);
+        out.push(row);
       }
-      out.push(row);
     }
   }
   return out;

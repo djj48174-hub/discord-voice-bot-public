@@ -408,6 +408,31 @@ const healthServer = http.createServer(async (req, res) => {
         return;
       }
 
+      // فحص المصادر يأكل معالج كثير — نسمح به فقط لمن يطلب صراحة (q أو vids أو diag=1)
+      const wantsSourceDiag =
+        u.searchParams.has('q') || u.searchParams.has('vids') || u.searchParams.get('diag') === '1';
+      if (!wantsSourceDiag) {
+        log('[diag] طلب بدون معاملات — ما نشغّل فحص المصادر الثقيل');
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify(
+            {
+              note: 'فحص المصادر يحتاج معامل: q=اسم أو vids=ids أو diag=1',
+              usage: {
+                info: '?info=1',
+                play: '?play=1 (نطق اختباري)',
+                song: '?song=اسم الأغنية (تشغيل فعلي)',
+                stt: '?stt=1',
+                sources: '?diag=1',
+              },
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+
       const data = await music.diagnose({
         query: u.searchParams.get('q') || '',
         vids: u.searchParams.get('vids') || '',
@@ -448,6 +473,27 @@ const healthServer = http.createServer(async (req, res) => {
           : null,
         uptime: Math.round(process.uptime()),
         voiceChat: guild && gs(guild.id).voiceChat ? gs(guild.id).voiceChat.stats : null,
+        music: guild
+          ? (() => {
+              try {
+                const q = music.getQueue(guild.id);
+                const cd2 = conn ? music.connConnectionData(conn) : null;
+                return {
+                  status: q.player.state.status,
+                  title: q.current?.title ?? null,
+                  source: q.current?.source ?? null,
+                  queued: q.songs?.length ?? 0,
+                  packetsPlayed: cd2?.packetsPlayed ?? null,
+                  positionSec:
+                    typeof q.player.state.playbackDuration === 'number'
+                      ? Math.round(q.player.state.playbackDuration / 1000)
+                      : null,
+                };
+              } catch (e) {
+                return { error: String(e.message).slice(0, 80) };
+              }
+            })()
+          : null,
         guilds: [...client.guilds.cache.values()].map((g2) => ({
           id: g2.id,
           name: g2.name,

@@ -33,6 +33,7 @@ const music = require('./music');
 const chat = require('./chat');
 const speech = require('./speech');
 const { VoiceChat } = require('./voicechat');
+const games = require('./games');
 
 // ---------------------------------------------------------------------------
 // الإعدادات
@@ -546,6 +547,14 @@ const healthServer = http.createServer(async (req, res) => {
         voiceSongCommands: VOICE_SONG_COMMANDS,
         // آخر عمليات تشغيل/إيقاف الرد الصوتي (لمعرفة متى انطفأ وبأي كلمة)
         voiceToggles: voiceToggleHistory,
+        // 🎮 حالة الألعاب لكل سيرفر
+        games: (() => {
+          try {
+            return games.status();
+          } catch (e) {
+            return { error: String(e.message).slice(0, 80) };
+          }
+        })(),
         music: guild
           ? (() => {
               try {
@@ -887,6 +896,20 @@ function connect(guild, channel) {
             return;
           }
 
+          // 🎮 الألعاب: إحصائيات لوحة التسلّط + تحدي الضحك/الصمت
+          try {
+            const gv = games.onVoice({
+              guild,
+              userId: u.userId,
+              name,
+              seconds: u.seconds,
+              duringSpeech: Boolean(u.duringSpeech),
+            });
+            if (gv && gv.handled) return;
+          } catch (e) {
+            log('⚠️ خطأ في لعبة صوتية:', String(e.message).slice(0, 120));
+          }
+
           // 2) الرد الصوتي متوقف؟ ما نرد — لكن ننفّذ أوامر الإيقاف/الخروج (عشان ما تعلق الأغنية)
           if (!st.voiceOn) {
             const t2 = normAr(text);
@@ -1118,9 +1141,11 @@ client.once('ready', async () => {
   // فحص مفتاح الذكاء الاصطناعي (لو موجود)
   chat.selfTest().catch((e) => log('تنبيه: فحص المحادثة فشل:', e.message));
 
+  // 🎮 الألعاب (روليت / خمّن الأوست / تحدي الضحك / تسلّط / تقليد / كازينو)
+  games.init({ music, log, speakLine, botChannelOf });
+
   // معلومات اللحظة للذكاء الاصطناعي: الروم، الأغنية الشغالة، حالة السوالف الصوتية
-  chat.setContextProvider((userLabel, guildId) => {
-    const out = [];
+  chat.setContextProvider((userLabel, guildId) => {    const out = [];
     try {
       const g =
         (guildId && client.guilds.cache.get(guildId)) ||
@@ -2059,14 +2084,21 @@ client.on('messageCreate', async (message) => {
     const content = message.content || '';
     // بدون "Message Content Intent" يوصل النص فقط للرسائل اللي فيها منشن أو الخاص
     const named = MSG_CONTENT && callsBotByName(content);
+    // صيغة أمر واضحة (شغل/طف/التالي/اسكت/أوامر الألعاب) — تنفّذ بدون منشن
+    const commandish =
+      MSG_CONTENT &&
+      (PLAY_INTENT.test(content) ||
+        STOP_INTENT.test(content) ||
+        SKIP_INTENT.test(content) ||
+        games.isGameText(content) ||
+        Boolean(voiceToggleIntent(content, false)));
 
-    if (!isDM && !mentioned && !named) return;
+    // لو ما فيه Message Content Intent ما نقدر نقرا الرسائل العادية أصلاً
+    if (!isDM && !mentioned && !named && !MSG_CONTENT) return;
 
     const key = isDM
       ? `dm:${message.author.id}`
       : `g:${message.guildId}:c:${message.channelId}:u:${message.author.id}`;
-
-    if (chat.throttled(key)) return;
 
     // نشيل المنشن واسم البوت من النص
     let text = content
@@ -2076,10 +2108,27 @@ client.on('messageCreate', async (message) => {
       .replace(/\s+/g, ' ')
       .trim();
 
-    log(
-      `💬 رسالة${isDM ? ' (خاص)' : ''} من ${message.author.tag}: ` +
-        `"${(text || '(فاضية)').slice(0, 80)}"`,
-    );
+    // 🎮 الألعاب (روليت/خمن/ضحك/تسلط/تقليد/كازينو) — قبل أي شي ثاني عشان ما يفوتنا تخمين
+    const gameResult = await games.handleMessage(message, text).catch((e) => {
+      log('⚠️ خطأ في لعبة:', String(e.message).slice(0, 120));
+      return null;
+    });
+    if (gameResult) {
+      await message.reply({ content: gameResult, allowedMentions: { repliedUser: false } });
+      return;
+    }
+
+    // باقي الأوامر (موسيقى/سوالف) تحتاج منشن أو اسم البوت أو صيغة أمر واضحة
+    if (!isDM && !mentioned && !named && !commandish) return;
+
+    if (chat.throttled(key)) return;
+
+    if (isDM || mentioned || named || commandish) {
+      log(
+        `💬 رسالة${isDM ? ' (خاص)' : ''} من ${message.author.tag}: ` +
+          `"${(text || '(فاضية)').slice(0, 80)}"`,
+      );
+    }
 
     await message.channel.sendTyping?.().catch(() => {});
 
@@ -2151,6 +2200,7 @@ async function registerCommands() {
       ),
     ...music.buildCommands(),
     ...chat.buildCommands(),
+    ...games.buildCommands(),
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
 
   try {
@@ -2199,6 +2249,10 @@ client.on('interactionCreate', async (interaction) => {
     // أوامر المحادثة (chat/chatreset)
     const chatHandled = await chat.handleInteraction(interaction);
     if (chatHandled) return;
+
+    // 🎮 أوامر الألعاب (roulette/guess/laugh/roast/mimic/casino/slot/dice/bet/rich/games)
+    const gamesHandled = await games.handleInteraction(interaction);
+    if (gamesHandled) return;
 
     if (interaction.commandName === 'join') {
       await interaction.deferReply();

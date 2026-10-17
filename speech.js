@@ -902,8 +902,8 @@ async function selfTest() {
         out.stt = { ok: false, error: r.quiet ? 'صوت واطي جداً' : 'تفريغ فاضي' };
         log('⚠️ التفريغ رجّع نص فاضي — تأكد من STT_MIN_DB أو الصوت');
       } else {
-        out.stt = { ok: true, text: r.text, model: STT_MODEL };
-        log(`✅ التفريغ يشتغل (${STT_MODEL}): "${r.text}"`);
+        out.stt = { ok: true, text: r.text, model: r.source === 'gemini' ? 'Gemini' : STT_MODEL };
+        log(`✅ التفريغ يشتغل (${out.stt.model}): "${r.text}"`);
       }
     } catch (e) {
       out.stt = { ok: false, error: e.message };

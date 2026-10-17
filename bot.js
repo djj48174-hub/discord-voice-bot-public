@@ -1251,13 +1251,17 @@ const SKIP_INTENT = /^\s*(?:تخطى|تخطي|سكب|التالي|اللي بع�
 const GENERIC_SONG_Q =
   /^(?:ال)?(?:لي|اغنيه|أغنيه|اغنية|أغنية|موسيقي|موسيقى|شي|شيء|شي زين|اي شي|أي شي|اي شيء|طرب|شغله|شغلة)$/;
 
-/** يجيب الروم الصوتي: روم المستخدم أو الروم المخصص للسيرفر */
+/** يجيب الروم الصوتي: الروم اللي البوت قاعد فيه (ثابت 24/7) أو روم المستخدم أو المخصص للسيرفر */
 async function resolveVoiceChannel(message) {
+  const guild = message.guild;
+  if (!guild) return null;
+  // الأولوية للروم اللي البوت قاعد فيه أصلاً — عشان ما ننقله من مكانه بالغلط
+  const current = botChannelOf(guild);
+  if (current) return current;
   const own = message.member?.voice?.channel;
   if (own) return own;
-  if (!message.guild) return null;
   try {
-    return await targetChannelFor(message.guild.id);
+    return await targetChannelFor(guild.id);
   } catch {
     return null;
   }

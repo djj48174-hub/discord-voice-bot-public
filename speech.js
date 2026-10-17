@@ -86,12 +86,15 @@ function ttsSpeedFilter(speed = TTS_SPEED) {
   return `atempo=${speed.toFixed(2)}`;
 }
 
-// أصوات عربية *رجالية* فقط — نحافظ على هوية صوتية واحدة ثابتة للبوت
+// أصوات عربية *رجالية خليجية* فقط — نحافظ على هوية صوتية واحدة ثابتة للبوت
+// (الأسماء مؤكدة من قائمة مايكروسوفت — الانتبه: الكويتي اسمه Fahed مو Naayf)
 const MALE_ARABIC_VOICES = [
-  'ar-SA-HamedNeural', // سعودي (رجالي)
-  'ar-KW-NaayfNeural', // كويتي (رجالي)
-  'ar-JO-TaimNeural', // أردني (رجالي)
-  'ar-EG-ShakirNeural', // مصري (رجالي)
+  'ar-SA-HamedNeural', // سعودي (الأساسي)
+  'ar-AE-HamdanNeural', // إماراتي
+  'ar-KW-FahedNeural', // كويتي
+  'ar-QA-MoazNeural', // قطري
+  'ar-BH-AliNeural', // بحريني
+  'ar-OM-AbdullahNeural', // عماني
 ];
 // الصوت الأساسي (ثابت) — والباقي للاحتياط فقط عند فشل الصوت الأساسي
 const TTS_VOICE = (process.env.TTS_VOICE || MALE_ARABIC_VOICES[0]).trim();
@@ -306,32 +309,59 @@ async function speakEdge(text, opts = {}) {
   throw lastErr || new Error('فشل Edge TTS');
 }
 
+// مزوّدو النطق اللي فشلوا مؤقتاً — نتخطاهم بدل ما نضيّع وقت ونغيّر الصوت كل مرة
+const ttsCooldown = new Map(); // provider -> { until, why }
+
+function ttsCooling(p) {
+  const c = ttsCooldown.get(p);
+  if (!c) return false;
+  if (Date.now() >= c.until) {
+    ttsCooldown.delete(p);
+    return false;
+  }
+  return true;
+}
+
+function setTtsCooldown(p, ms, why) {
+  if (ttsCooling(p)) return;
+  ttsCooldown.set(p, { until: Date.now() + ms, why });
+  log(`⏸️ ${p}: أوقفته مؤقتاً ${Math.round(ms / 1000)} ثانية (${why})`);
+}
+
 /**
  * يرجّع صوتاً (Ogg Opus 48kHz ستيريو) جاهزاً للتشغيل في ديسكورد مباشرة.
- * الترتيب قابل للتغيير عبر TTS_ORDER (الافتراضي: Groq -> Edge -> Google)
+ * الترتيب عبر TTS_ORDER — الافتراضي: Edge (صوت سعودي رجالي ثابت) -> Groq -> Google
+ * سبب ترتيب Edge أولاً: Groq Orpheus يتقيّد كثير (429) فيتغيّر الصوت فجأة.
  */
 async function speak(text, opts = {}) {
   const clean = String(text || '').trim();
   if (!clean) throw new Error('ما فيه نص للنطق');
 
-  const order = String(process.env.TTS_ORDER || 'groq,edge,google')
+  const order = String(process.env.TTS_ORDER || 'edge,groq,google')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 
   let lastErr = null;
 
-  for (const provider of order) {
+  // نتخطى المزوّد اللي فشل مؤخراً (يصير الصوت أثبت + أسرع بلا محاولات ضايعة)
+  let providers = order.filter((p) => !ttsCooling(p));
+  if (!providers.length) {
+    log('⚠️ كل محركات النطق في فترة توقف — أحاول الأول على أي حال');
+    providers = [order[0]];
+  }
+
+  for (const provider of providers) {
     try {
       if (provider === 'groq') {
         if (!GROQ_KEY) throw new Error('ما فيه مفتاح Groq للنطق');
         const ogg = await speakGroq(clean, opts);
-        log(`🔊 صوت جاهز (Groq Orpheus): ${ogg.length} بايت`);
+        log(`🔊 صوت جاهز (Groq ${GROQ_TTS_VOICE}): ${ogg.length} بايت`);
         return ogg;
       }
       if (provider === 'edge') {
         const ogg = await speakEdge(clean, opts);
-        log(`🔊 صوت جاهز (Edge): ${ogg.length} بايت`);
+        log(`🔊 صوت جاهز (Edge ${opts.voice || TTS_VOICE}): ${ogg.length} بايت`);
         return ogg;
       }
       if (provider === 'google') {
@@ -348,6 +378,11 @@ async function speak(text, opts = {}) {
           '👉 مطلوب موافقة شروط Groq مرة واحدة فقط (من حسابك): ' +
             'https://console.groq.com/playground?model=canopylabs%2Forpheus-arabic-saudi',
         );
+        setTtsCooldown(provider, 60 * 60 * 1000, 'يحتاج موافقة شروط');
+      } else if (/\b429\b|rate.?limit|too many requests/i.test(msg)) {
+        setTtsCooldown(provider, 15 * 60 * 1000, 'تجاوز الحد (429)');
+      } else {
+        setTtsCooldown(provider, 2 * 60 * 1000, 'خطأ مؤقت');
       }
     }
   }

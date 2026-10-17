@@ -726,6 +726,11 @@ client.once('ready', async () => {
     .then((r) => log(`🧪 فحص التفريغ: ${r?.stt?.ok ? 'شغّال' : 'مشكلة — ' + (r?.stt?.error || 'غير معروف')}`))
     .catch((e) => log('⚠️ فحص التفريغ فشل:', String(e.message).slice(0, 140)));
 
+  // تسخين جُمل التأكيد المتكررة بنفس الصوت — تصير فورية وما تتأثر بأي تقييد لاحق
+  speech
+    .warmTtsCache()
+    .catch((e) => log('⚠️ تسخين النطق فشل:', String(e.message).slice(0, 140)));
+
   if (VOICE_CHANNEL_ID) {
     await ensureConnected();
   } else {

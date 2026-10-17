@@ -294,28 +294,34 @@ function extraFilterMale(provider) {
 
 /**
  * محرّك Edge TTS (أصوات مايكروسوفت العربية) — مجاني لكن يتقيّد (429).
+ * ⚠️ مهم: نبقى على **نفس الصوت** دائماً. لا نبدّل الصوت عند الفشل —
+ *    نعيد المحاولة على نفس الصوت (429 عند مايكروسوفت لحظي ويرجع بسرعة).
  */
 async function speakEdge(text, opts = {}) {
-  const voices = voiceFallbacks(opts.voice);
+  const voice = (opts.voice || TTS_VOICE).trim();
+  const tries = Math.max(1, Math.min(6, Number(process.env.TTS_EDGE_TRIES || 3)));
   let lastErr = null;
-  for (let attempt = 0; attempt < Math.min(3, voices.length); attempt++) {
+
+  for (let attempt = 0; attempt < tries; attempt++) {
     try {
       const tts = new MsEdgeTTS();
-      await tts.setMetadata(voices[attempt], OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+      await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
       const { audioStream } = await tts.toStream(text, { rate: opts.rate || TTS_RATE });
 
-      if (attempt === 0) log(`🎙️ الصوت: ${voices[attempt]} (رجالي)`);
+      if (attempt === 0) log(`🎙️ الصوت: ${voice} (رجالي)`);
 
       const mp3 = await streamToBuffer(audioStream);
       if (mp3.length < 200) throw new Error('الصوت فاضي من محرّك النطق');
+      if (attempt > 0) log(`🎙️ نجح Edge (${voice}) من المحاولة ${attempt + 1}`);
       return await toDiscordOgg(mp3);
     } catch (e) {
       lastErr = e;
       const msg = String(e.message || e);
-      log(`⚠️ محاولة Edge (${voices[attempt]}) ${attempt + 1} فشلت: ${msg.slice(0, 90)}`);
-      // 429 = تقييد — ننتقل للاحتياطي بسرعة
-      if (/\b429\b|rate.?limit|throttl/i.test(msg)) break;
-      await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+      const throttled = /\b429\b|rate.?limit|throttl|too many/i.test(msg);
+      log(`⚠️ محاولة Edge (${voice}) ${attempt + 1}/${tries} فشلت: ${msg.slice(0, 90)}`);
+      if (attempt + 1 >= tries) break;
+      // 429 لحظي عند مايكروسوفت — ننتظر شوي ونعيد على نفس الصوت
+      await new Promise((r) => setTimeout(r, (throttled ? 1000 : 500) * (attempt + 1)));
     }
   }
   throw lastErr || new Error('فشل Edge TTS');
@@ -365,6 +371,46 @@ function ttsCacheSet(key, buf) {
   if (!key || !buf || buf.length < 500) return;
   ttsCache.set(key, buf);
   while (ttsCache.size > TTS_CACHE_MAX) ttsCache.delete(ttsCache.keys().next().value);
+}
+
+/**
+ * تسخين الكاش عند الإقلاع: الجُمل المتكررة (تأكيدات الأوامر) تُنطق مرة واحدة
+ * بنفس الصوت وتُحفظ، فتصير فورية ودائماً بنفس الصوت حتى لو صار تقييد لاحقاً.
+ */
+const WARM_LINES = [
+  'طيب، وقفتها.',
+  'ما سمعتك زين، كررها؟',
+  'حاضر، أشغّلها لك',
+  'ما فيه شي شغال الحين.',
+  'طيب، جبت اللي بعدها.',
+  'طيب، وقفتها مؤقتاً. قول كمل عشان أكملها.',
+  'طيب، كملت.',
+  'ما فهمت زين، كررها مرة ثانية؟',
+  'أنا معك في الروم، تفضل.',
+  'طيب، رجعت للروم.',
+  'حاضر، كيف أقدر أساعدك؟',
+  'ما لقيت الروم الصوتي.',
+];
+
+async function warmTtsCache(lines = WARM_LINES) {
+  const voice = TTS_VOICE;
+  let ok = 0;
+  for (const text of lines) {
+    if (ttsCacheGet(ttsCacheKey(text, { voice }))) {
+      ok++;
+      continue;
+    }
+    try {
+      const ogg = await speak(text, { voice });
+      if (ogg) ok++;
+      await new Promise((r) => setTimeout(r, 250));
+    } catch (e) {
+      log(`⚠️ تسخين النطق فشل ("${text.slice(0, 30)}"): ${String(e.message).slice(0, 80)}`);
+      if (ttsCooling('edge')) break; // لا فايدة نكمل وEdge موقوف
+    }
+  }
+  log(`⚡ كاش النطق: ${ok}/${lines.length} جملة جاهزة بنفس الصوت (${voice})`);
+  return ok;
 }
 
 /**
@@ -429,7 +475,8 @@ async function speak(text, opts = {}) {
         );
         setTtsCooldown(provider, 60 * 60 * 1000, 'يحتاج موافقة شروط');
       } else if (/\b429\b|rate.?limit|too many requests/i.test(msg)) {
-        setTtsCooldown(provider, 15 * 60 * 1000, 'تجاوز الحد (429)');
+        // Edge: التقييد لحظي → نرجع له بسرعة عشان الصوت يبقى ثابت
+        setTtsCooldown(provider, provider === 'edge' ? 20 * 1000 : 5 * 60 * 1000, 'تجاوز الحد (429)');
       } else {
         setTtsCooldown(provider, 2 * 60 * 1000, 'خطأ مؤقت');
       }
@@ -1012,4 +1059,6 @@ module.exports = {
   transcribeGemini,
   transcribeWhisper,
   GEMINI_STT_MODELS,
+  warmTtsCache,
+  TTS_VOICE,
 };

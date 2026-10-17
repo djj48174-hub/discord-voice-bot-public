@@ -55,6 +55,10 @@ const MSG_CONTENT =
 // حالة كل سيرفر على حدة — البوت يخدم أكثر من سيرفر في نفس الوقت
 // الرد الصوتي: الافتراضي من الإعدادات، وكل سيرفر له حالته (تشغيل/إيقاف مستقل)
 const VOICE_CHAT_DEFAULT = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
+// أوامر الموسيقى/الروم بالصوت — مقفلة افتراضياً: الأوامر (شغل/طف/التالي) تكون من الشات
+// نطق "شغل الأغنية" بالصوت يسبب سوء فهم للأسماء — الشات أدق
+const VOICE_SONG_COMMANDS =
+  String(process.env.VOICE_SONG_COMMANDS || 'false').toLowerCase() === 'true';
 const guildState = new Map();
 function gs(guildId) {
   const id = String(guildId || '');
@@ -878,29 +882,32 @@ function connect(guild, channel) {
           // 2) الرد الصوتي متوقف؟ ما نرد — لكن ننفّذ أوامر الإيقاف/الخروج (عشان ما تعلق الأغنية)
           if (!st.voiceOn) {
             const t2 = normAr(text);
-            const urgent = matchStopCommand(t2, playingNow) || V_LEAVE_RE.test(t2);
-            if (!urgent) {
-              log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
-              return;
-            }
-            const done2 = await runVoiceCommand(guild, text).catch(() => null);
-            if (done2) {
-              log(`🎛️ (الرد الصوتي متوقف) نفّذت أمر: "${text}"`);
-              if (typeof done2.after === 'function') {
-                await done2.after().catch?.((e) => log('⚠️ تنفيذ الأمر:', String(e.message).slice(0, 120)));
+            const urgent =
+              VOICE_SONG_COMMANDS && (matchStopCommand(t2, playingNow) || V_LEAVE_RE.test(t2));
+            if (urgent) {
+              const done2 = await runVoiceCommand(guild, text).catch(() => null);
+              if (done2) {
+                log(`🎛️ (الرد الصوتي متوقف) نفّذت أمر: "${text}"`);
+                if (typeof done2.after === 'function') {
+                  await done2
+                    .after()
+                    .catch?.((e) => log('⚠️ تنفيذ الأمر:', String(e.message).slice(0, 120)));
+                }
+                return;
               }
-              return;
             }
             log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
             return;
           }
 
-          // 3) أوامر الروم بالصوت (شغّل أغنية / اطلع / وقف / التالي / الصوت)
+          // 3) أوامر الروم بالصوت — مقفلة افتراضياً: الموسيقى والأوامر تُرسل من الشات
           let vcmd = null;
-          try {
-            vcmd = await runVoiceCommand(guild, text);
-          } catch (e) {
-            log('⚠️ خطأ في الأمر الصوتي:', String(e.message).slice(0, 140));
+          if (VOICE_SONG_COMMANDS) {
+            try {
+              vcmd = await runVoiceCommand(guild, text);
+            } catch (e) {
+              log('⚠️ خطأ في الأمر الصوتي:', String(e.message).slice(0, 140));
+            }
           }
           if (vcmd) {
             log(`🎛️ أمر صوتي: "${text}"`);
@@ -1232,9 +1239,15 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 // تنفيذ كلام المستخدم فعلياً (موسيقى) من الشات
 // ---------------------------------------------------------------------------
 const PLAY_INTENT =
-  /^\s*(?:يا\s*)?(?:شغل لي|شغّل لي|شغل|شغّل|سمعني|سمّعني|ابغى اسمع|أبغى اسمع|ابي اسمع|أبي اسمع|play me|play)\s*[:،\-]?\s*(.+)$/i;
+  /^\s*(?:يا\s*)?(?:شغل لي|شغّل لي|شغللي|شغّللي|شغل|شغّل|حط لي|حطلي|سمعني|سمّعني|ابغى اسمع|أبغى اسمع|ابي اسمع|أبي اسمع|play me|play)\s*[:،\-]?\s*(.+)$/i;
+// صيغ إضافية للكتابة: «ابي أغنية X»، «ودي اسمع X»
+const PLAY_INTENT2 =
+  /^\s*(?:يا\s*)?(?:ابغى|ابغي|ابي|أبي|ودي|نفسي)\s+(?:اسمع|اغنيه|أغنيه|اغنية|أغنية|موسيقي|موسيقى|طرب)\s*[:،\-]?\s*(.+)$/i;
 const STOP_INTENT = /^\s*(?:وقف|أوقف|اوقف|اقفل|سكّر|سكر|اسكت|خلص|stop)\s*[!.؟]*$/i;
 const SKIP_INTENT = /^\s*(?:تخطى|تخطي|سكب|التالي|اللي بعدها|skip|next)\s*[!.؟]*$/i;
+// طلب عام بدون اسم أغنية («شغل لي» / «شغل الأغنية») — ما نشغّل شي عشوائي
+const GENERIC_SONG_Q =
+  /^(?:ال)?(?:لي|اغنيه|أغنيه|اغنية|أغنية|موسيقي|موسيقى|شي|شيء|شي زين|اي شي|أي شي|اي شيء|طرب|شغله|شغلة)$/;
 
 /** يجيب الروم الصوتي: روم المستخدم أو الروم المخصص للسيرفر */
 async function resolveVoiceChannel(message) {
@@ -1256,25 +1269,61 @@ async function runMusicFromChat(message, text) {
   const guild = message.guild;
   if (!guild) return null;
 
-  if (STOP_INTENT.test(text)) {
-    if (!music.hasQueue(guild.id) || !music.getQueue(guild.id).current) {
-      return 'ما فيه شي شغّال أصلاً 🤷';
-    }
-    music.getQueue(guild.id).stopAll();
+  const t = normAr(text); // نسخة منظّفة للمطابقة (بدون همزات/رموز/تشكيل)
+  const m0 = music.hasQueue(guild.id) ? music.getQueue(guild.id) : null;
+  const isPlaying = Boolean(m0 && m0.current);
+
+  // إيقاف («طفها»، «وقف الأغنية»، «سكرها» …)
+  if (STOP_INTENT.test(text) || STOP_INTENT.test(t) || matchStopCommand(t, isPlaying)) {
+    if (!isPlaying && !(m0 && m0.songs.length)) return 'ما فيه شي شغّال أصلاً 🤷';
+    m0?.stopAll();
     return '⏹️ وقفت الموسيقى وفضّيت الطابور.';
   }
 
-  if (SKIP_INTENT.test(text)) {
-    const m = music.hasQueue(guild.id) ? music.getQueue(guild.id) : null;
-    if (!m || !m.current) return 'ما فيه شي شغّال 🤷';
-    m.skip();
+  // التالي («تخطى»، «غير الأغنية» …)
+  if (SKIP_INTENT.test(text) || SKIP_INTENT.test(t) || V_SKIP_RE.test(t)) {
+    if (!isPlaying) return 'ما فيه شي شغّال 🤷';
+    m0.skip();
     return '⏭️ تخطيت الأغنية.';
   }
 
-  const play = text.match(PLAY_INTENT);
+  if (isPlaying && V_PAUSE_RE.test(t)) {
+    m0.player?.pause();
+    return '⏸️ وقفتها مؤقتاً — اكتب «كمل» وأرجّعها.';
+  }
+  if (isPlaying && V_RESUME_RE.test(t)) {
+    m0.player?.unpause();
+    return '▶️ كمّلت الأغنية.';
+  }
+
+  if (V_LOOP_OFF_RE.test(t)) {
+    m0?.toggleLoop(false);
+    return '⏹️ وقفت التكرار.';
+  }
+  if (V_LOOP_RE.test(t)) {
+    m0?.toggleLoop(true);
+    return '🔁 شغّلت التكرار — بيعيد الأغنية نفسها لما تخلص.';
+  }
+
+  if (isPlaying && (V_VOL_UP_RE.test(t) || V_VOL_DOWN_RE.test(t))) {
+    const up = V_VOL_UP_RE.test(t);
+    const v = Math.min(1, Math.max(0.05, (m0.volume ?? 0.7) + (up ? 0.15 : -0.15)));
+    m0.setVolume(v);
+    return `🔊 الصوت الآن ${Math.round(v * 100)}%.`;
+  }
+
+  if (isPlaying && V_NOW_RE.test(t)) {
+    return `🎧 شغّال الآن: **${m0.current.title}**${
+      m0.songs.length ? `\n📜 وبالطابور: ${m0.songs.length}` : ''
+    }`;
+  }
+
+  const play = text.match(PLAY_INTENT) || t.match(PLAY_INTENT) || text.match(PLAY_INTENT2);
   if (!play) return null;
   const query = cleanSongQuery((play[1] || '').replace(/^لي\s+/, '').trim());
-  if (!query) return null;
+  if (!query || GENERIC_SONG_Q.test(normAr(query))) {
+    return '🎵 اكتب اسم الأغنية بعد الأمر — مثل: `شغل لي محمد عبده`';
+  }
 
   const channel = await resolveVoiceChannel(message);
   if (!channel) return '⚠️ ما لقيت روم صوتي — اكتب `/join` أول.';
@@ -1570,8 +1619,10 @@ const V_SKIP_RE =
 // «لا مو هذي» = الأغنية اللي شغّلها غلط -> نشغّل أفضل بديل من نفس البحث
 const V_WRONG_RE =
   /^(?:لا مو هذي|لا مو هاذي|مو هذي|مو هاذي|مو ذي|مو هي|مو هذاك|مو هذي الاغنيه|لا لا مو هذي|غلط|خطا|مو غلط|هذي مو هي|هذي غلط|جيب غيرها|غيرها|ابي غيرها|ابغى غيرها|شي ثاني|جيب شي ثاني|مو هالاغنيه)$/;
-const V_PAUSE_RE = /^(?:وقفها شوي|وقف الموسيقي شوي|اسكت شوي|بريح|بريك|pause)$/;
-const V_RESUME_RE = /^(?:كمل|كملها|اكمل|واصل|شغلها مره ثانيه|شغل الموسيقي|resume|continue)$/;
+const V_PAUSE_RE =
+  /^(?:وقفها شوي|وقف شوي|وقفها مؤقت|وقف مؤقت|ايقاف مؤقت|وقف الموسيقي شوي|اسكت شوي|بريح|بريك|pause)$/;
+const V_RESUME_RE =
+  /^(?:كمل|كملها|اكمل|اكملها|كمل الاغنيه|واصل|شغلها مره ثانيه|شغل الموسيقي|رجع الاغنيه|resume|continue)$/;
 const V_LOOP_RE = /^(?:كرر|كررها|اعد|اعيد|كرر الاغنيه|loop)$/;
 const V_LOOP_OFF_RE = /^(?:الغي التكرار|وقف التكرار|لا تكرر|loop off)$/;
 const V_VOL_UP_RE = /^(?:ارفع الصوت|علي الصوت|زود الصوت|ارفع شوي|صوتك واطي|ارفع صوتك|ارفع صوت)$/;

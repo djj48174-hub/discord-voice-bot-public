@@ -539,6 +539,8 @@ const healthServer = http.createServer(async (req, res) => {
         uptime: Math.round(process.uptime()),
         voiceChat: guild && gs(guild.id).voiceChat ? gs(guild.id).voiceChat.stats : null,
         lastVoice: lastVoice,
+        // أوامر الموسيقى بالصوت: مقفلة = الأوامر من الشات فقط
+        voiceSongCommands: VOICE_SONG_COMMANDS,
         music: guild
           ? (() => {
               try {

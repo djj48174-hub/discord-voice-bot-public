@@ -98,6 +98,40 @@ const healthServer = http.createServer(async (req, res) => {
     try {
       const u = new URL(req.url, 'http://localhost');
 
+      // فحص سريع للاتصال الصوتي بدون تشغيل صوت (info=1)
+      if (u.searchParams.get('info') === '1') {
+        const g = (GUILD_ID && client.guilds.cache.get(GUILD_ID)) || client.guilds.cache.first();
+        const conn = g ? getVoiceConnection(g.id) : null;
+        const cd = conn ? music.connConnectionData(conn) : null;
+        const dave = conn ? music.connDave(conn) : null;
+        const chId = conn?.joinConfig?.channelId;
+        const ch = chId ? g?.channels?.cache?.get(chId) : null;
+        const voice = g?.members?.me?.voice;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify(
+            {
+              connStatus: conn?.state?.status ?? null,
+              channelName: ch?.name ?? null,
+              members: ch ? [...ch.members.values()].map((mm) => mm.displayName) : [],
+              selfMute: conn?.joinConfig?.selfMute ?? null,
+              selfDeaf: conn?.joinConfig?.selfDeaf ?? null,
+              serverMute: voice?.mute ?? null,
+              serverDeaf: voice?.deaf ?? null,
+              packetsPlayed: cd?.packetsPlayed ?? null,
+              encryptionMode: cd?.encryptionMode ?? null,
+              daveProtocol: dave?.protocolVersion ?? null,
+              daveReady: dave?.session?.ready ?? false,
+              voiceChat: voiceChat ? voiceChat.stats : null,
+              voiceDebug: music.getVoiceDebug(50),
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+
       // تشغيل صوت تجريبي في الروم الصوتي (لتشخيص مشكلة عدم سماع الرد)
       if (u.searchParams.get('play') === '1') {
         const send = (obj, code = 200) => {
@@ -287,6 +321,16 @@ const healthServer = http.createServer(async (req, res) => {
           : null,
         uptime: Math.round(process.uptime()),
         voiceChat: voiceChat ? voiceChat.stats : null,
+        voiceMembers: (() => {
+          const ch = inChannelId ? guild?.channels?.cache?.get(inChannelId) : null;
+          return ch ? [...ch.members.values()].map((mm) => mm.displayName) : [];
+        })(),
+        dave: conn
+          ? {
+              ready: Boolean(music.connDave(conn)?.session?.ready),
+              protocol: music.connDave(conn)?.protocolVersion ?? null,
+            }
+          : null,
         voiceState: guild?.members?.me?.voice
           ? {
               mute: guild.members.me.voice.mute ?? null,

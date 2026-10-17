@@ -4,7 +4,16 @@
  */
 'use strict';
 
-const { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho, translitArabic } = require('./bot');
+const {
+  normAr,
+  voiceToggleIntent,
+  forSpeech,
+  runVoiceCommand,
+  looksLikeEcho,
+  translitArabic,
+  matchStopCommand,
+  cleanSongQuery,
+} = require('./bot');
 const { isJunkTranscript } = require('./speech');
 const { scoreMatch, normTitle } = require('./music');
 
@@ -59,6 +68,50 @@ async function main() {
   section('كشف صدى صوت البوت (looksLikeEcho)');
   ok(looksLikeEcho('حاضر أشغلها لك', 'طيب، حاضر أشغلها لك') === true, 'نفس كلام البوت = صدى');
   ok(looksLikeEcho('هلا وش أخبارك', 'طيب، شغالة الآن أغنية') === false, 'كلام مختلف = مو صدى');
+
+  section('أمر إيقاف الأغنية (matchStopCommand)');
+  const stopCases = [
+    ['وقف', false, true],
+    ['وقف الأغنية', false, true],
+    ['طفها', true, true],
+    ['طفّه', true, true],
+    ['طفاها', true, true],
+    ['أقول قفلها خلاص', true, true],
+    ['أطفيها', true, true],
+    ['خلص طفة يا ولد', true, true],
+    ['طفيها يا بوت', true, true],
+    ['قفلها الحين', true, true],
+    ['سكرها', true, true],
+    ['خلاص', true, true],
+    ['خلاص', false, false],
+    ['قفل الباب', true, false],
+    ['كم عمرك', true, false],
+    ['وش أخبارك اليوم يا بوت', true, false],
+    ['شغل لي أغنية كاظم الساهر', true, false],
+  ];
+  for (const [txt, playing, want] of stopCases) {
+    const got = matchStopCommand(txt, playing);
+    ok(got === want, `"${txt}" (شغال=${playing}) -> ${got}`);
+  }
+
+  section('«وقف الصوت» لا يعطّل الرد الصوتي وقت الموسيقى');
+  ok(voiceToggleIntent('وقف الصوت', true) === null, 'وقف الصوت + موسيقى شغالة = وقف الأغنية');
+  ok(voiceToggleIntent('وقف الصوت', false) === 'off', 'وقف الصوت بدون موسيقى = إيقاف الرد');
+  ok(voiceToggleIntent('وقف الرد الصوتي', true) === 'off', 'وقف الرد الصوتي يظل يعطّل الرد');
+
+  section('تنظيف اسم الأغنية (cleanSongQuery)');
+  const qCases = [
+    ['أغنية اسمها Love On Catwalk.', 'Love On Catwalk'],
+    ['اغنيه اسمها كاظم الساهر', 'كاظم الساهر'],
+    ['موسيقى هادية', 'هادية'],
+    ['Love On Catwalk.', 'Love On Catwalk'],
+    ['طيب أغنية اسمها محمد عبده', 'محمد عبده'],
+    ['اسمها رابح صقر', 'رابح صقر'],
+  ];
+  for (const [inp, want] of qCases) {
+    const got = cleanSongQuery(inp);
+    ok(got === want, `"${inp}" -> "${got}"`);
+  }
 
   section('اختيار الأغنية الصحيحة (scoreMatch)');
   const song = (title, uploader = '', duration = 240) => ({ title, uploader, duration });

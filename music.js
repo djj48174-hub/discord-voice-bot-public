@@ -546,11 +546,13 @@ async function resolveQuery(query, maxPlaylist = 25) {
   //         بينما ساوند كلاود يشتغل عادي.
   //
   // مهم: نجيب عدة نتائج ونقيّمها (مو أول نتيجة على الأعمى) عشان ما نشغّل أغنية عشوائية.
-  const MIN_SCORE = Number(process.env.MUSIC_MIN_SCORE || 0.45);
+  const MIN_SCORE = Number(process.env.MUSIC_MIN_SCORE || 0.35);
+  const WEAK_MIN = Number(process.env.MUSIC_WEAK_MIN || 0.15);
   const SC_N = Math.max(3, Number(process.env.SC_CANDIDATES || 10));
   const YT_N = Math.max(3, Number(process.env.YT_CANDIDATES || 6));
 
   let bestAny = null; // أفضل مرشح من أي مصدر (نستعمله لو كلهم ضعاف)
+  let bestRanked = [];
 
   const preferYouTube = /^youtube$/i.test((process.env.PREFER_SOURCE || '').trim());
   if (!preferYouTube) {
@@ -559,6 +561,7 @@ async function resolveQuery(query, maxPlaylist = 25) {
       if (sc.length) {
         const { ranked, best } = rankCandidates(q, sc);
         bestAny = best;
+        bestRanked = ranked;
         log(`🔎 ساوند كلاود (${ranked.length} نتيجة) — الأفضل: ${fmtCandidates(ranked)}`);
         if (best.score >= MIN_SCORE) {
           return { type: 'single', songs: [{ ...best, score: undefined, source: 'soundcloud' }], ranked };
@@ -574,7 +577,10 @@ async function resolveQuery(query, maxPlaylist = 25) {
     const results = await searchSongs(q, YT_N);
     if (results.length) {
       const { ranked, best } = rankCandidates(q, results);
-      if (!bestAny || best.score > bestAny.score) bestAny = best;
+      if (!bestAny || best.score > bestAny.score) {
+        bestAny = best;
+        bestRanked = ranked;
+      }
       log(`🔎 يوتيوب (${ranked.length} نتيجة) — الأفضل: ${fmtCandidates(ranked)}`);
       if (best.score >= MIN_SCORE) {
         return { type: 'single', songs: [{ ...best, score: undefined, source: 'youtube' }], ranked };
@@ -590,7 +596,22 @@ async function resolveQuery(query, maxPlaylist = 25) {
     }
   }
 
-  // ما فيه مطابقة واضحة — نرفض بدل ما نشغّل شي عشوائي، ونسجّل أقرب شي للمعلومة
+  // ما فيه مطابقة واضحة
+  // لو فيه نتيجة قريبة معقولة → نشغّلها ونقول للمستخدم «لو مو هي قل: لا مو هذي»
+  // (أفضل من الاعتذار، لأن المستخدم غالباً قاصد أغنية حقيقية والتفريغ يمكن يغلط)
+  if (bestAny && bestAny.score >= WEAK_MIN) {
+    log(
+      `🤏 مطابقة ضعيفة (${Math.round(bestAny.score * 100)}%) — بشغّل الأقرب: "${bestAny.title}"`,
+    );
+    return {
+      type: 'single',
+      songs: [{ ...bestAny, score: undefined }],
+      ranked: bestRanked,
+      weak: true,
+      query: q,
+    };
+  }
+
   const hint = bestAny ? ` (أقرب نتيجة: "${bestAny.title}")` : '';
   const err = new Error(`ما لقيت أغنية بالاسم هذا${hint}`);
   err.code = 'NO_MATCH';

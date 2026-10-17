@@ -493,7 +493,15 @@ function connect(guild, channel) {
             'صديقي';
 
           // 1) هل هو أمر صوتي (شغّل / وقف الرد الصوتي)؟
-          const intent = voiceToggleIntent(text);
+          const playingNow = (() => {
+            try {
+              const q = music.getQueue(guild.id);
+              return Boolean(q && q.current);
+            } catch {
+              return false;
+            }
+          })();
+          const intent = voiceToggleIntent(text, playingNow);
           if (intent) {
             const wasOn = voiceChatOn;
             setVoiceChat(intent === 'on', `بالكلام من ${name}`);
@@ -515,8 +523,22 @@ function connect(guild, channel) {
             return;
           }
 
-          // 2) الرد الصوتي متوقف؟ نتجاهل الكلام (بس نظل نسمع عشان أمر التشغيل)
+          // 2) الرد الصوتي متوقف؟ ما نرد — لكن ننفّذ أوامر الإيقاف/الخروج (عشان ما تعلق الأغنية)
           if (!voiceChatOn) {
+            const t2 = normAr(text);
+            const urgent = matchStopCommand(t2, playingNow) || V_LEAVE_RE.test(t2);
+            if (!urgent) {
+              log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
+              return;
+            }
+            const done2 = await runVoiceCommand(guild, text).catch(() => null);
+            if (done2) {
+              log(`🎛️ (الرد الصوتي متوقف) نفّذت أمر: "${text}"`);
+              if (typeof done2.after === 'function') {
+                await done2.after().catch?.((e) => log('⚠️ تنفيذ الأمر:', String(e.message).slice(0, 120)));
+              }
+              return;
+            }
             log('🔇 الرد الصوتي متوقف — تجاهلت الكلام');
             return;
           }
@@ -577,18 +599,39 @@ function connect(guild, channel) {
       voiceChat = new VoiceChat(conn, {
         onUtterance: async (u) => {
           if (voiceBusy) {
-            // البوت مشغول — نحفظ آخر كلام عشان نرد عليه بعد ما نخلص (بدل ما نرميه)
-            pendingVoice = u;
-            log('⏳ البوت مشغول — بحفظ كلامك وأرد عليه بعد ما أخلص ردي');
+            // البوت مشغول — نحفظ كلامك عشان نرد عليه بعد ما نخلص (بدل ما نرميه)
+            // ولو وصل مقطع ثاني بسرعة ندمجهم: كثير ينسحب كلام المتحدث والبوت يتكلم
+            // (نص الجملة قبل ونصها بعد) فدمجهم يعطينا جملة مفهومة.
+            const now = Date.now();
+            if (
+              pendingVoice &&
+              pendingVoice.userId === u.userId &&
+              now - pendingVoice.at < 4000
+            ) {
+              // نضيف صمت قصير بينهم عشان الكلام ما يتلاصق
+              const gap = Array.from({ length: 8 }, () => Buffer.from([0xf8, 0xff, 0xfe]));
+              pendingVoice = {
+                ...pendingVoice,
+                packets: pendingVoice.packets.concat(gap, u.packets),
+                count: (pendingVoice.count || 0) + (u.count || 0),
+                at: now,
+              };
+              log(`⏳ البوت مشغول — دمجت مقاطعك (${pendingVoice.packets.length} حزمة)`);
+            } else {
+              pendingVoice = { ...u, at: now };
+              log('⏳ البوت مشغول — بحفظ كلامك وأرد عليه بعد ما أخلص ردي');
+            }
             return;
           }
           await handleVoice(u);
           // نعالج آخر كلام وصل أثناء الرد
-          while (pendingVoice) {
+          let guard = 0;
+          while (pendingVoice && guard++ < 4) {
             const next = pendingVoice;
             pendingVoice = null;
             await handleVoice(next);
           }
+          pendingVoice = null;
         },
       });
       voiceChat.setEnabled(voiceChatOn);
@@ -793,7 +836,7 @@ async function runMusicFromChat(message, text) {
 
   const play = text.match(PLAY_INTENT);
   if (!play) return null;
-  const query = (play[1] || '').replace(/^لي\s+/, '').trim();
+  const query = cleanSongQuery((play[1] || '').replace(/^لي\s+/, '').trim());
   if (!query) return null;
 
   const channel = await resolveVoiceChannel(message);
@@ -824,8 +867,9 @@ async function runMusicFromChat(message, text) {
   }
 
   const started = await m.startAndWait(60000);
+  const weakNote = resolved.weak ? '\n⚠️ مو متأكد إنها هي — لو مو هي اكتب نفس الطلب مع اسم أوضح.' : '';
   return started
-    ? `▶️ شغّالة الآن: **${resolved.songs[0].title}** 🎧`
+    ? `▶️ شغّالة الآن: **${resolved.songs[0].title}** 🎧${weakNote}`
     : '❌ ما قدرت أشغّلها — جرّب تكتب اسمها بطريقة ثانية.';
 }
 
@@ -941,11 +985,17 @@ const VOICE_ON_PHRASES = [
 
 /**
  * يفحص إذا النص أمر تشغيل/إيقاف للرد الصوتي.
+ * @param {string} raw
+ * @param {boolean} playing فيه موسيقى شغالة الحين؟ (عشان «وقف الصوت» تعني وقف الأغنية)
  * @returns {'on'|'off'|null}
  */
-function voiceToggleIntent(raw) {
+function voiceToggleIntent(raw, playing = false) {
   const t = normAr(raw);
   if (!t || t.length > 45) return null;
+  // «وقف الصوت / اقفل الصوت / وقف» وأمثالها: لو فيه أغنية شغالة يقصد يوقفها
+  if (playing && /^(?:وقف|اوقف|وقفها|اقفل|قفل|طفي|اطفي|سكر|اسكر)\s*(?:ال)?(?:صوت|صوتك)?(?: الحين)?$/.test(t)) {
+    return null;
+  }
   // نفحص الإيقاف أول (لأن "لا ترد علي" تحتوي "رد علي")
   if (VOICE_OFF_PHRASES.some((p) => t.includes(p))) return 'off';
   if (VOICE_ON_PHRASES.some((p) => t.includes(p))) return 'on';
@@ -1008,11 +1058,67 @@ const V_LEAVE_RE =
 const V_JOIN_RE = /^(?:ادخل|ادخل الروم|دخل الروم|ارجع|ارجع للروم|رجعني|تعال الروم|تعال للروم)$/;
 const V_NOW_RE =
   /^(?:(?:وش|ايش)\s+(?:تشغل|شغال|الاغنيه|الاغاني|الطابور)(?:\s+الحين)?|وش اللي شغال|وش هذي الاغنيه|وش اللي تشغله)$/;
-// إيقاف الموسيقى (واضح)
+// إيقاف الموسيقى (صيغ واضحة تماماً)
 const V_STOP_RE =
   /^(?:وقف|اوقف|وقفها|ايقاف|اوقفها|وقف الموسيقي|وقف الاغنيه|وقف الاغاني|طفي الموسيقي|اطفي الموسيقي|اقفل الموسيقي|قفل الموسيقي|سكر الموسيقي|سكرها)$/;
 // كلمات قصيرة تعني "سكّت الصوت" — نقبلها فقط إذا فيه موسيقى شغالة
-const V_STOP_WEAK_RE = /^(?:بس|خلاص|اسكت|سكت|تكفي)$/;
+const V_STOP_WEAK_RE = /^(?:بس|خلاص|خلص|اسكت|سكت|تكفي)$/;
+
+// أفعال الإيقاف بكل الصيغ اللي يكتبها Whisper («طفّه» -> طفه/طفاها/اطفيها...)
+const STOP_VERBS = [
+  'وقف', 'اوقف', 'وقفه', 'وقفها', 'وقفوا', 'وقفي', 'اوقفها', 'اوقفه', 'اوقفي',
+  'طفي', 'اطفي', 'طفه', 'اطفه', 'طفها', 'اطفها', 'طفاها', 'اطفاها', 'طفيها', 'اطفيها', 'اطفيه',
+  'بطفيها', 'بطفي', 'طفوها', 'طقها', 'اطقها',
+  'قفل', 'اقفل', 'قفله', 'اقفله', 'قفلها', 'اقفلها', 'اقفلي',
+  'سكر', 'اسكر', 'سكره', 'سكرها', 'اسكرها',
+  'كتم', 'اكتم', 'كتمها', 'اكتمها',
+  'بطل', 'ابطل', 'بطلها', 'ابطله', 'بطلي',
+];
+const STOP_OBJECTS = [
+  'الاغنيه', 'اغنيه', 'الاغاني', 'اغاني', 'اغنيتك', 'اغنيتي', 'الموسيقي', 'موسيقي', 'موسيقاك',
+  'الصوت', 'صوت', 'صوتك', 'الشغله', 'شغله', 'الطرب', 'طرب', 'ذا', 'ذي', 'هذي', 'هذا', 'هالاغنيه',
+];
+const STOP_FILL = [
+  'يا', 'طيب', 'الحين', 'يعني', 'والله', 'لا', 'اقول', 'اقولك', 'قول', 'ولد', 'ياب', 'بط', 'بوت',
+  'قوم', 'شوي', 'اذا', 'سمعت', 'قلت', 'لك', 'ممكن', 'لو', 'سمحت', 'هو', 'انت', 'انتي', 'كذا',
+];
+const STOP_VERB_SET = new Set(STOP_VERBS);
+const STOP_OBJ_SET = new Set(STOP_OBJECTS);
+const STOP_FILL_SET = new Set(STOP_FILL);
+// صيغ قريبة من أفعال الإيقاف (لو الاسم انكتب غلط)
+const STOP_STEM_RE =
+  /^(?:ا?طف(?:ي|ه|ها|يها|يه|او|و|وا)?|ا?طق(?:ي|ه|ها)?|ا?وقف(?:ي|ه|ها|و|وا)?|ا?قفل(?:ي|ه|ها)?|ا?سكر(?:ي|ه|ها)?|ا?كتم(?:ي|ه|ها)?|ا?بطل(?:ي|ه|ها)?)$/;
+
+/**
+ * هل الجملة أمر إيقاف للموسيقى؟ نقبل الصيغ القريبة: «طفّه»، «طفاها»، «قفلها خلاص»، «طفيها يا بوت».
+ */
+function matchStopCommand(raw, playing = false) {
+  const t = normAr(raw);
+  if (!t) return false;
+  if (V_STOP_RE.test(t)) return true;
+  if (playing && V_STOP_WEAK_RE.test(t)) return true;
+
+  const words = t.split(' ').filter(Boolean);
+  if (words.length > 8) return false;
+
+  const allowed = (w) =>
+    STOP_VERB_SET.has(w) ||
+    STOP_OBJ_SET.has(w) ||
+    STOP_FILL_SET.has(w) ||
+    V_STOP_WEAK_RE.test(w) ||
+    w.length <= 2;
+
+  if (words.some((w) => STOP_VERB_SET.has(w) || STOP_STEM_RE.test(w))) {
+    // كل الكلمات لازم تكون إيقاف/مفعول/حشو — عشان ما نوقف على كلام عادي فيه "وقف"
+    if (words.every((w) => allowed(w) || STOP_STEM_RE.test(w))) return true;
+  }
+
+  // جملة قصيرة أثناء التشغيل + صيغة قريبة = أمر إيقاف
+  if (playing && words.length <= 3 && words.every((w) => allowed(w) || STOP_STEM_RE.test(w))) {
+    return true;
+  }
+  return false;
+}
 const V_SKIP_RE =
   /^(?:تخطي|تخطى|سكب|التالي|التاليه|اللي بعدها|غير الاغنيه|غير الموسيقي|بدلها|روح للي بعدها|skip|next)$/;
 // «لا مو هذي» = الأغنية اللي شغّلها غلط -> نشغّل أفضل بديل من نفس البحث
@@ -1028,6 +1134,26 @@ const V_GENERIC_SONG_RE = /^(?:لي|اغنيه|موسيقي|شي|شيء|اي ش�
 // طلب تشغيل أغنية بالصوت (يسمح بكلمة تمهيدية مثل "طيب" أو "يا")
 const V_PLAY_RE =
   /^(?:(?:طيب|يا|هلا|يالله|يلا|لو سمحت|ممكن|الحين|هي|والله)\s+)*(?:شغّل لي|شغل لي|شغللي|شغلي|شغّللي|سمّعني|سمعني|ابغي اسمع|أبغي اسمع|ابي اسمع|أبي اسمع|شغل اغنية|شغّل أغنية|شغل اغنيه|شغّل|شغل|play me|play)\s*[:،\-]?\s*(.+)$/i;
+
+/** ينظّف كلام الطلب من الحشو عشان البحث يلقى الأغنية */
+function cleanSongQuery(raw) {
+  let q = String(raw || '')
+    .replace(/[\u064B-\u0652\u0670\u0640]/g, '')
+    .trim();
+  // ترقيم وعلامات أطراف
+  q = q.replace(/^[\s"'«»\-–—.،,:!؟?]+/, '').replace(/[\s"'«»\-–—.،,:!؟?]+$/, '');
+  // كلمات تمهيدية
+  q = q.replace(/^(?:يا|طيب|هلا|يالله|يلا|لو سمحت|ممكن|الحين|هي|والله|بعد|كمان|ايضا|أيضا)\s+/u, '');
+  // «أغنية اسمها X» / «اسمها X» / «أغنية X»
+  q = q.replace(
+    /^(?:ال)?(?:أغنية|اغنية|أغنيه|اغنيه|أغني|اغني|أغاني|اغاني|موسيقى|موسيقي|شغله|شغلة|طرب)\s+(?:اسمها|اسمه|باسم|اسم)\s+/u,
+    '',
+  );
+  q = q.replace(/^(?:اسمها|اسمه|باسم|اسم)\s+/u, '');
+  q = q.replace(/^(?:ال)?(?:أغنية|اغنية|أغنيه|اغنيه|أغني|اغني|أغاني|اغاني|موسيقى|موسيقي)\s+/u, '');
+  q = q.replace(/\s+/g, ' ').trim();
+  return q;
+}
 
 /** روم البوت الصوتي الحالي */
 function botVoiceChannel(guild) {
@@ -1146,13 +1272,20 @@ async function playByVoice(guild, query) {
 
   m.songs.push(...resolved.songs);
   const title = forSpeech(resolved.songs[0].title);
+  const weak = Boolean(resolved.weak);
 
   if (!wasIdle) {
-    return { say: `ضفتها للطابور. الحين شغالة ${forSpeech(m.current?.title || '')}.` };
+    return {
+      say: weak
+        ? `ضفتها، بس مو متأكد إنها هي: ${title}. لو مو هي قل: لا مو هذي.`
+        : `ضفتها للطابور. الحين شغالة ${forSpeech(m.current?.title || '')}.`,
+    };
   }
 
   return {
-    say: `طيب، شغالة الآن ${title}.`,
+    say: weak
+      ? `مو متأكد إنها هي، بس هذي أقرب شي: ${title}. لو مو هي قل: لا مو هذي.`
+      : `طيب، شغالة الآن ${title}.`,
     after: async () => {
       try {
         const ok = await m.startAndWait(60000);
@@ -1219,14 +1352,14 @@ async function runVoiceCommand(guild, rawText) {
   }
 
   // ---- وقف الموسيقى ----
-  if (V_STOP_RE.test(n) || (playing && V_STOP_WEAK_RE.test(n))) {
+  if (matchStopCommand(n, playing)) {
     if (!playing) return { say: 'ما فيه شي شغال الحين.' };
     try {
       m0.stopAll();
     } catch {
       /* ignore */
     }
-    return { say: 'طيب، وقفت الموسيقى.' };
+    return { say: 'طيب، وقفتها.' };
   }
 
   // ---- «لا مو هذي» : شغّل بديل من نفس البحث ----
@@ -1320,7 +1453,7 @@ async function runVoiceCommand(guild, rawText) {
     // نستخرج الاسم من النص الأصلي عشان نحفظ الإملاء
     const rawMatch = String(rawText || '').match(V_PLAY_RE);
     let query = String((rawMatch && rawMatch[1]) || playN[1] || '').trim();
-    query = query.replace(/^لي\s+/, '').trim();
+    query = cleanSongQuery(query.replace(/^لي\s+/, ''));
     if (!query || V_GENERIC_SONG_RE.test(normAr(query))) {
       return { say: 'وش الأغنية اللي تبي أشغلها؟' };
     }
@@ -1379,7 +1512,15 @@ client.on('messageCreate', async (message) => {
     await message.channel.sendTyping?.().catch(() => {});
 
     // أمر تشغيل/إيقاف الرد الصوتي (بالكتابة)
-    const vIntent = voiceToggleIntent(text);
+    const playingTxt = (() => {
+      try {
+        const q = message.guildId ? music.getQueue(message.guildId) : null;
+        return Boolean(q && q.current);
+      } catch {
+        return false;
+      }
+    })();
+    const vIntent = voiceToggleIntent(text, playingTxt);
     if (vIntent) {
       const on = setVoiceChat(vIntent === 'on', `بالكتابة من ${message.author.tag}`);
       await message.reply({
@@ -1619,5 +1760,14 @@ if (require.main === module) {
   });
 } else {
   // يسمح باختبار الأوامر الصوتية بدون تشغيل البوت (test-voicecmd.js)
-  module.exports = { normAr, voiceToggleIntent, forSpeech, runVoiceCommand, looksLikeEcho, translitArabic };
+  module.exports = {
+    normAr,
+    voiceToggleIntent,
+    forSpeech,
+    runVoiceCommand,
+    looksLikeEcho,
+    translitArabic,
+    matchStopCommand,
+    cleanSongQuery,
+  };
 }

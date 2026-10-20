@@ -33,6 +33,15 @@ const music = require('./music');
 const chat = require('./chat');
 const speech = require('./speech');
 const { VoiceChat } = require('./voicechat');
+const admin = require('./admin');
+const profanity = require('./profanity');
+const quran = require('./quran');
+
+// ---------------------------------------------------------------------------
+// ميزات ملغاة: صار البوت إداري فقط (لا موسيقى ولا صوت)
+// ---------------------------------------------------------------------------
+const MUSIC_ENABLED = false;
+const VOICE_ENABLED = false;
 
 // ---------------------------------------------------------------------------
 // الإعدادات
@@ -652,6 +661,7 @@ if (SELF_URL && String(process.env.SELF_PING || 'true').toLowerCase() !== 'false
 let joinTimer = null; // مؤقت إعادة الدخول (للمسار العام بدون سيرفر محدد)
 
 function scheduleJoin(delayMs = 5000, guildId = '') {
+  if (!VOICE_ENABLED) return;
   const key = String(guildId || '');
   const st = key ? gs(key) : null;
   const run = () => {
@@ -1111,15 +1121,22 @@ client.once('ready', async () => {
   await registerCommands();
 
   // فحص أدوات الموسيقى (yt-dlp + ffmpeg)
-  try {
-    music.diagnostics();
-  } catch (e) {
-    log('تنبيه: فحص أدوات الموسيقى فشل:', e.message);
+  if (MUSIC_ENABLED) {
+    try {
+      music.diagnostics();
+    } catch (e) {
+      log('تنبيه: فحص أدوات الموسيقى فشل:', e.message);
+    }
   }
+
+  // جدولة آية/ذكر كل ساعتين في روم القرآن 📖
+  quran.start(client);
 
   // فحص عملاء يوتيوب بالخلفية واختيار أول واحد شغّال
   // (يتجاوز حجب "Sign in to confirm you're not a bot")
-  music.ensureWorkingClient().catch((e) => log('تنبيه: فحص عملاء يوتيوب فشل:', e.message));
+  if (MUSIC_ENABLED) {
+    music.ensureWorkingClient().catch((e) => log('تنبيه: فحص عملاء يوتيوب فشل:', e.message));
+  }
 
   // فحص مفتاح الذكاء الاصطناعي (لو موجود)
   chat.selfTest().catch((e) => log('تنبيه: فحص المحادثة فشل:', e.message));
@@ -1156,27 +1173,31 @@ client.once('ready', async () => {
     return out.join('\n');
   });
 
-  // فحص محرّك النطق (يبيّن أي مزوّد يشتغل: Groq / Edge / Google)
-  speech
-    .speak('أنا جاهز أسمعك وأرد عليك')
-    .then((ogg) => log(`✅ محرّك النطق شغّال (${ogg.length} بايت)`))
-    .catch((e) => log('❌ محرّك النطق ما يشتغل:', String(e.message).slice(0, 160)));
+  if (VOICE_ENABLED) {
+    // فحص محرّك النطق (يبيّن أي مزوّد يشتغل: Groq / Edge / Google)
+    speech
+      .speak('أنا جاهز أسمعك وأرد عليك')
+      .then((ogg) => log(`✅ محرّك النطق شغّال (${ogg.length} بايت)`))
+      .catch((e) => log('❌ محرّك النطق ما يشتغل:', String(e.message).slice(0, 160)));
 
-  // فحص التفريغ (Gemini أولاً ثم Whisper) — يولّد جملة ويكشفها، يبيّن لنا وش شغّال بالسيرفر
-  speech
-    .selfTest()
-    .then((r) => log(`🧪 فحص التفريغ: ${r?.stt?.ok ? 'شغّال' : 'مشكلة — ' + (r?.stt?.error || 'غير معروف')}`))
-    .catch((e) => log('⚠️ فحص التفريغ فشل:', String(e.message).slice(0, 140)));
+    // فحص التفريغ (Gemini أولاً ثم Whisper) — يولّد جملة ويكشفها، يبيّن لنا وش شغّال بالسيرفر
+    speech
+      .selfTest()
+      .then((r) => log(`🧪 فحص التفريغ: ${r?.stt?.ok ? 'شغّال' : 'مشكلة — ' + (r?.stt?.error || 'غير معروف')}`))
+      .catch((e) => log('⚠️ فحص التفريغ فشل:', String(e.message).slice(0, 140)));
 
-  // تسخين جُمل التأكيد المتكررة بنفس الصوت — تصير فورية وما تتأثر بأي تقييد لاحق
-  speech
-    .warmTtsCache()
-    .catch((e) => log('⚠️ تسخين النطق فشل:', String(e.message).slice(0, 140)));
+    // تسخين جُمل التأكيد المتكررة بنفس الصوت — تصير فورية وما تتأثر بأي تقييد لاحق
+    speech
+      .warmTtsCache()
+      .catch((e) => log('⚠️ تسخين النطق فشل:', String(e.message).slice(0, 140)));
+  } else {
+    log('🎙️ الصوت ملغي — البوت إداري فقط (لا موسيقى ولا كلام).');
+  }
 
   // ندخل الروم الصوتي في كل سيرفر (المحدد بالإعدادات أو أول روم صوتي متاح)
   const AUTO_JOIN_ALL =
-    String(process.env.AUTO_JOIN_ALL || 'true').toLowerCase() !== 'false';
-  if (AUTO_JOIN_ALL || configuredChannelIds().length) {
+    VOICE_ENABLED && String(process.env.AUTO_JOIN_ALL || 'true').toLowerCase() !== 'false';
+  if (AUTO_JOIN_ALL || (VOICE_ENABLED && configuredChannelIds().length)) {
     await ensureConnected();
   } else {
     log('ما فيه روم محدد بالإعدادات ودخول باقي السيرفرات متوقف.');
@@ -1193,10 +1214,92 @@ client.on('guildCreate', (guild) => {
   ensureBotRole(guild).catch(() => {});
   // نسجّل الأوامر في السيرفر الجديد فوراً، وندخل روم صوتي لو الدخول التلقائي مفعّل
   registerCommands().catch(() => {});
-  if (String(process.env.AUTO_JOIN_ALL || 'true').toLowerCase() !== 'false') {
+  if (
+    VOICE_ENABLED &&
+    String(process.env.AUTO_JOIN_ALL || 'true').toLowerCase() !== 'false'
+  ) {
     setTimeout(() => ensureConnected(guild.id).catch(() => {}), 4000);
   }
 });
+
+// الترحيب بالأعضاء الجدد 👋
+const WELCOME_CHANNEL_ID = (process.env.WELCOME_CHANNEL_ID || '').trim();
+const WELCOME_CHANNEL_NAME = (
+  process.env.WELCOME_CHANNEL_NAME || '👋｜الترحيب'
+).trim();
+const RULES_CHANNEL_ID = (process.env.RULES_CHANNEL_ID || '').trim();
+
+function findWelcomeChannel(guild) {
+  if (!guild) return null;
+  if (WELCOME_CHANNEL_ID) {
+    const byId = guild.channels.cache.get(WELCOME_CHANNEL_ID);
+    if (byId && byId.isTextBased?.()) return byId;
+  }
+  return (
+    guild.channels.cache.find(
+      (c) => c.isTextBased?.() && c.name === WELCOME_CHANNEL_NAME,
+    ) ||
+    guild.channels.cache.find(
+      (c) => c.isTextBased?.() && String(c.name).includes('الترحيب'),
+    ) ||
+    null
+  );
+}
+
+function findRulesChannel(guild) {
+  if (!guild) return null;
+  if (RULES_CHANNEL_ID) {
+    const byId = guild.channels.cache.get(RULES_CHANNEL_ID);
+    if (byId && byId.isTextBased?.()) return byId;
+  }
+  return (
+    guild.channels.cache.find(
+      (c) => c.isTextBased?.() && String(c.name).includes('القوانين'),
+    ) || null
+  );
+}
+
+async function sendWelcome(member) {
+  const channel = findWelcomeChannel(member.guild);
+  if (!channel) return;
+  const rules = findRulesChannel(member.guild);
+  const created = Math.floor(member.user.createdTimestamp / 1000);
+  const joined = Math.floor(Date.now() / 1000);
+  const total = member.guild.memberCount;
+
+  await channel.send({
+    content: `<@${member.id}>`,
+    allowedMentions: { users: [member.id] },
+    embeds: [
+      {
+        title: `👋 أهلاً ${member.displayName || member.user.username}`,
+        description:
+          'نوّرت السيرفر! 🎉\n\n' +
+          '**خطوتك الأولى:** تطلع لك أسئلة الترحيب — جاوب عليها ' +
+          '(ولد/بنت، العمر، ألعابك) وبتنفتح لك الرومات والفويسات اللي تبيها.\n\n' +
+          (rules ? `📜 اقرأ القوانين أول شي: <#${rules.id}>` : '📜 اقرأ القوانين أول شي.'),
+        color: 0xf1c40f,
+        thumbnail: member.user.displayAvatarURL?.({ size: 256 })
+          ? { url: member.user.displayAvatarURL({ size: 256 }) }
+          : undefined,
+        fields: [
+          {
+            name: '👥 الأعضاء',
+            value: `أنت العضو رقم **${total}**`,
+            inline: true,
+          },
+          {
+            name: '🎮 الرومات',
+            value: 'اختر ألعابك وبتظهر لك تلقائياً',
+            inline: true,
+          },
+        ],
+        footer: { text: 'استمتع — وأي مشكلة كلّم الإدارة' },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  });
+}
 
 // إعطاء العضو الجديد رتبة "عضو" تلقائياً 👤
 client.on('guildMemberAdd', async (member) => {
@@ -1208,17 +1311,25 @@ client.on('guildMemberAdd', async (member) => {
     );
   if (!role) {
     log(`⚠️ رتبة العضو (${MEMBER_ROLE_NAME}) غير موجودة في ${member.guild.name}`);
-    return;
+  } else {
+    try {
+      await member.roles.add(role, 'رتبة العضو الافتراضية');
+      log(`👤 أعطيت ${member.user.username} رتبة ${role.name}`);
+    } catch (e) {
+      log(`⚠️ تعذر إعطاء رتبة العضو لـ ${member.user.username}: ${e.message}`);
+    }
   }
+
   try {
-    await member.roles.add(role, 'رتبة العضو الافتراضية');
-    log(`👤 أعطيت ${member.user.username} رتبة ${role.name}`);
+    await sendWelcome(member);
+    log(`👋 رحّبت بـ ${member.user.username} في ${member.guild.name}`);
   } catch (e) {
-    log(`⚠️ تعذر إعطاء رتبة العضو لـ ${member.user.username}: ${e.message}`);
+    log(`⚠️ تعذر إرسال الترحيب لـ ${member.user.username}: ${e.message}`);
   }
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
+  if (!VOICE_ENABLED) return;
   if (!client.user || newState.id !== client.user.id) return;
   const vState = gs(newState.guild?.id);
   if (!vState.autoRejoin) return;
@@ -1579,6 +1690,7 @@ function voiceToggleIntent(raw, playing = false) {
  * @param {string} guildId سيرفر محدد (وإلا يطبّق على كل السيرفرات)
  */
 function setVoiceChat(on, by = '', guildId = '') {
+  if (!VOICE_ENABLED) return false;
   const ids = guildId ? [String(guildId)] : [...guildState.keys()];
   for (const id of ids) {
     const s = gs(id);
@@ -2079,7 +2191,7 @@ function callsBotByName(text) {
 // ---------------------------------------------------------------------------
 const HONEYPOT_CHANNEL_ID = (process.env.HONEYPOT_CHANNEL_ID || '').trim();
 const HONEYPOT_CHANNEL_NAME = (
-  process.env.HONEYPOT_CHANNEL_NAME || '🍯｜honeypot'
+  process.env.HONEYPOT_CHANNEL_NAME || 'honeypot'
 ).trim();
 const HONEYPOT_LOG_CHANNEL_ID = (process.env.HONEYPOT_LOG_CHANNEL_ID || '').trim();
 const HONEYPOT_LOG_CHANNEL_NAME = (
@@ -2091,7 +2203,10 @@ const HONEYPOT_KICK =
 function isHoneypotChannel(channel) {
   if (!channel) return false;
   if (HONEYPOT_CHANNEL_ID && channel.id === HONEYPOT_CHANNEL_ID) return true;
-  return channel.name === HONEYPOT_CHANNEL_NAME;
+  return (
+    channel.name === HONEYPOT_CHANNEL_NAME ||
+    (typeof channel.name === 'string' && channel.name.endsWith('honeypot'))
+  );
 }
 
 function findHoneypotLogChannel(guild) {
@@ -2222,8 +2337,79 @@ async function handleHoneypot(message) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// فلتر القذف: حذف الرسالة + تايم أوت ساعة 🚫
+// ---------------------------------------------------------------------------
+async function handleProfanity(message) {
+  if (!message.guild || !message.author || message.author.bot) return false;
+  const content = message.content || '';
+  if (!content) return false;
+
+  const hit = profanity.detect(content);
+  if (!hit) return false;
+
+  const member =
+    message.member ||
+    (await message.guild.members.fetch(message.author.id).catch(() => null));
+  if (!member) return false;
+  // الإدارة والمالك مستثنون
+  if (member.permissions?.has(PermissionFlagsBits.ManageGuild)) return false;
+
+  let deleted = false;
+  try {
+    await message.delete();
+    deleted = true;
+  } catch (err) {
+    log('تعذر حذف رسالة القذف:', err.message);
+  }
+
+  let timedOut = false;
+  try {
+    if (member.moderatable) {
+      await member.timeout(profanity.TIMEOUT_MS, `قذف/سب: ${hit}`);
+      timedOut = true;
+    }
+  } catch (err) {
+    log('تعذر تايم أوت القذف:', err.message);
+  }
+
+  const logChannel = findHoneypotLogChannel(message.guild);
+  if (logChannel) {
+    await logChannel
+      .send({
+        embeds: [
+          {
+            title: '🚫 قذف/سب — تايم أوت ساعة',
+            description:
+              `العضو: <@${message.author.id}> (\`${message.author.tag}\`)\n` +
+              `الروم: <#${message.channelId}>\n` +
+              `الكلمة: \`${hit}\`\n` +
+              `حذف الرسالة: ${deleted ? '✅' : '❌'}\n` +
+              `تايم أوت ساعة: ${timedOut ? '✅' : '❌'}`,
+            color: 0xed4245,
+            timestamp: new Date().toISOString(),
+          },
+        ],
+        allowedMentions: { parse: [] },
+      })
+      .catch(() => {});
+  }
+
+  const notice = await message.channel
+    .send({
+      content: `🚫 ممنوع القذف والسب يا <@${message.author.id}> — تم حذف رسالتك وتايم أوت **ساعة كاملة**.`,
+      allowedMentions: { users: [message.author.id] },
+    })
+    .catch(() => null);
+  if (notice) setTimeout(() => notice.delete().catch(() => {}), 8000);
+
+  log(`🚫 قذف من ${message.author.tag} (${hit}) — حذف=${deleted} تايم أوت=${timedOut}`);
+  return true;
+}
+
 client.on('messageCreate', async (message) => {
   if (await handleHoneypot(message)) return;
+  if (await handleProfanity(message)) return;
   if (!CHAT_ENABLED) return;
   try {
     if (!message.author || message.author.bot) return;
@@ -2258,40 +2444,47 @@ client.on('messageCreate', async (message) => {
 
     await message.channel.sendTyping?.().catch(() => {});
 
-    // أمر تشغيل/إيقاف الرد الصوتي (بالكتابة)
-    const playingTxt = (() => {
-      try {
-        const q = message.guildId ? music.getQueue(message.guildId) : null;
-        return Boolean(q && q.current);
-      } catch {
-        return false;
-      }
-    })();
-    const vIntent = voiceToggleIntent(text, playingTxt);
-    if (vIntent) {
-      const on = setVoiceChat(
-        vIntent === 'on',
-        `بالكتابة من ${message.author.tag}: «${String(text || '').slice(0, 50)}»`,
-        message.guild?.id,
-      );
-      await message.reply({
-        content: on
-          ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'
-          : '⛔ وقفت الرد الصوتي — من الحين ما أتكلم في الروم.\n' +
-              'ترجعه بإحدى الطرق:\n' +
-              '• `/voice` → **تشغيل**\n' +
-              '• أو اكتب هنا: **شغّل الرد الصوتي**\n' +
-              '• أو قل في الروم بالصوت: **«شغّل الرد الصوتي»**',
-        allowedMentions: { repliedUser: false },
-      });
+    // أوامر إدارية بالكتابة: «يا بوت ميوت @فلان 60»
+    const adminReply = await admin.handleText(message, text);
+    if (adminReply) {
+      await message.reply({ content: adminReply, allowedMentions: { repliedUser: false } });
       return;
     }
 
-    // أولاً: هل هو أمر موسيقى؟ ("شغل لي ...") — ننفّذه فعلياً
-    const musicResult = await runMusicFromChat(message, text);
-    if (musicResult) {
-      await message.reply({ content: musicResult, allowedMentions: { repliedUser: false } });
-      return;
+    // أمر تشغيل/إيقاف الرد الصوتي (بالكتابة) — ملغي
+    if (VOICE_ENABLED) {
+      const playingTxt = (() => {
+        try {
+          const q = message.guildId ? music.getQueue(message.guildId) : null;
+          return Boolean(q && q.current);
+        } catch {
+          return false;
+        }
+      })();
+      const vIntent = voiceToggleIntent(text, playingTxt);
+      if (vIntent) {
+        const on = setVoiceChat(
+          vIntent === 'on',
+          `بالكتابة من ${message.author.tag}: «${String(text || '').slice(0, 50)}»`,
+          message.guild?.id,
+        );
+        await message.reply({
+          content: on
+            ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'
+            : '⛔ وقفت الرد الصوتي — من الحين ما أتكلم في الروم.',
+          allowedMentions: { repliedUser: false },
+        });
+        return;
+      }
+    }
+
+    // أولاً: هل هو أمر موسيقى؟ ("شغل لي ...") — ملغي
+    if (MUSIC_ENABLED) {
+      const musicResult = await runMusicFromChat(message, text);
+      if (musicResult) {
+        await message.reply({ content: musicResult, allowedMentions: { repliedUser: false } });
+        return;
+      }
     }
 
     const r = await chat.reply({
@@ -2311,20 +2504,8 @@ client.on('messageCreate', async (message) => {
 // ---------------------------------------------------------------------------
 async function registerCommands() {
   const commands = [
-    new SlashCommandBuilder().setName('join').setDescription('يدخل الروم الصوتي ويقعد فيه'),
-    new SlashCommandBuilder().setName('leave').setDescription('يطلع من الروم ويوقف الرجوع التلقائي'),
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
-    new SlashCommandBuilder()
-      .setName('voice')
-      .setDescription('يشغّل أو يوقف الرد الصوتي في الروم 🎙️')
-      .addStringOption((o) =>
-        o
-          .setName('الحالة')
-          .setDescription('تشغيل أو إيقاف')
-          .setRequired(true)
-          .addChoices({ name: 'تشغيل', value: 'on' }, { name: 'إيقاف', value: 'off' }),
-      ),
-    ...music.buildCommands(),
+    ...admin.buildCommands(),
     ...chat.buildCommands(),
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
 
@@ -2365,102 +2546,25 @@ client.on('interactionCreate', async (interaction) => {
   log(`📥 أمر: /${interaction.commandName} — من ${interaction.user.tag} (${interaction.guild?.name ?? 'خاص'})`);
 
   try {
-    // أوامر الموسيقى أولاً (play/skip/pause/resume/stop/queue/nowplaying/volume)
-    const handled = await music.handleInteraction(interaction, {
-      defaultChannelId: VOICE_CHANNEL_ID,
-    });
-    if (handled) return;
+    // أوامر الإدارة أولاً (حظر/طرد/تايم أوت/مسح/قفل/رتب/إعلانات)
+    const adminHandled = await admin.handleInteraction(interaction);
+    if (adminHandled) return;
 
     // أوامر المحادثة (chat/chatreset)
     const chatHandled = await chat.handleInteraction(interaction);
     if (chatHandled) return;
 
-    if (interaction.commandName === 'join') {
-      await interaction.deferReply();
-      const gid = interaction.guild?.id;
-      if (gid) gs(gid).autoRejoin = true;
-
-      // نفضّل روم المتصل نفسه (لو هو داخل روم صوتي في نفس السيرفر)
-      let channel = interaction.member?.voice?.channel ?? null;
-
-      // وإلا الروم المخصص لهذا السيرفر (من الإعدادات أو آخر روم دخلناه)
-      if (!channel && gid) channel = await targetChannelFor(gid).catch(() => null);
-
-      if (!channel && VOICE_CHANNEL_ID && interaction.guildId) {
-        const ch = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-        if (ch && ch.guildId === interaction.guildId) channel = ch;
-      }
-      if (!channel) {
-        await interaction.editReply(
-          'ما لقيت روم صوتي. ادخل روم صوتي بنفسك واكتب /join أو حدد روم بالإعدادات.',
-        );
-        return;
-      }
-      const guild = channel.guild;
-      gs(guild.id).autoRejoin = true;
-      gs(guild.id).channelId = channel.id;
-      const conn = getVoiceConnection(guild.id);
-      if (conn) conn.destroy();
-      connect(guild, channel);
-      await interaction.editReply(`دخلت الروم الصوتي: **${channel.name}** ✅`);
-      return;
-    }
-
-    if (interaction.commandName === 'leave') {
-      if (interaction.guild) gs(interaction.guild.id).autoRejoin = false;
-      // نوقف الموسيقى أيضاً
-      if (interaction.guild && music.hasQueue(interaction.guild.id)) {
-        try {
-          music.getQueue(interaction.guild.id).stopAll();
-        } catch {
-          /* ignore */
-        }
-      }
-      const conn = interaction.guild ? getVoiceConnection(interaction.guild.id) : null;
-      if (conn) {
-        conn.destroy();
-        await interaction.reply('طلعت من الروم ووقفت الرجوع التلقائي. اكتب `/join` عشان أرجع.');
-      } else {
-        await interaction.reply('أنا أصلاً مو داخل أي روم.');
-      }
-      return;
-    }
-
-    if (interaction.commandName === 'voice') {
-      const v = interaction.options.getString('الحالة');
-      const on = setVoiceChat(v === 'on', `أمر /voice من ${interaction.user.username}`, interaction.guildId);
-      await interaction.reply(
-        on
-          ? '✅ شغّلت الرد الصوتي — تكلم في الروم وأنا أرد عليك بالصوت.'
-          : '⛔ وقفت الرد الصوتي.\n' +
-              'ترجعه بإحدى الطرق:\n' +
-              '• `/voice` → **تشغيل**\n' +
-              '• أو قل في الروم بالصوت: **«شغّل الرد الصوتي»**',
-      );
-      return;
-    }
-
     if (interaction.commandName === 'status') {
-      const gid = interaction.guild?.id;
-      const conn = gid ? getVoiceConnection(gid) : null;
-      const st = gid ? gs(gid) : null;
-      if (conn && conn.state.status === VoiceConnectionStatus.Ready) {
-        await interaction.reply(
-          `داخل الروم 🟢\n` +
-            `اسم الروم: **${interaction.guild.channels.cache.get(conn.joinConfig.channelId)?.name ?? 'غير معروف'}**\n` +
-            `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
-            `الرجوع التلقائي: ${st?.autoRejoin ? 'مفعّل' : 'متوقف'}\n` +
-            `الرد الصوتي: ${st?.voiceOn ? 'مفعّل ✅' : 'متوقف ⛔'}\n` +
-            `السوالف: ${CHAT_ENABLED ? 'مفعّل' : 'متوقف'}\n` +
-            `ذكاء اصطناعي: ${
-              chat.hasAI()
-                ? `${chat.model || 'متصل'} — موديلات متاحة: ${chat.stats().gemini + chat.stats().groq}`
-                : 'لا (ردود جاهزة)'
-            }`,
-        );
-      } else {
-        await interaction.reply('لست داخل أي روم صوتي 🔴');
-      }
+      await interaction.reply(
+        `🛡️ **بوت إداري**\n` +
+          `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
+          `السيرفرات: ${client.guilds.cache.size}\n` +
+          `السوالف النصية: ${CHAT_ENABLED ? 'مفعّلة' : 'متوقفة'}\n` +
+          `الموسيقى: ⛔ ملغية\n` +
+          `الصوت: ⛔ ملغي\n` +
+          `فلتر القذف: ✅ حذف + تايم أوت ساعة\n` +
+          `الأوامر: \`/adminhelp\``,
+      );
     }
   } catch (err) {
     log('خطأ في الأمر:', err.message);
@@ -2479,7 +2583,7 @@ client.on('interactionCreate', async (interaction) => {
       .reply({
         content:
           `ما عرفت الأمر \`/${interaction.commandName}\` 😅\n` +
-          'الأوامر المتاحة: `/play` `/skip` `/pause` `/resume` `/stop` `/queue` `/nowplaying` `/volume` `/join` `/leave` `/status` `/chat`',
+          'الأوامر المتاحة: `/adminhelp` لجميع أوامر الإدارة، و`/status`.',
         ephemeral: true,
       })
       .catch(() => {});
@@ -2490,7 +2594,9 @@ client.on('interactionCreate', async (interaction) => {
 // الفحص الدوري
 // ---------------------------------------------------------------------------
 setInterval(() => {
-  ensureConnected().catch((e) => log('خطأ في الفحص الدوري:', e.message));
+  if (VOICE_ENABLED) {
+    ensureConnected().catch((e) => log('خطأ في الفحص الدوري:', e.message));
+  }
 
   // مراقبة الذاكرة (كل دقيقتين) — تكشف التسريب/الحدود قبل ما يقتلنا المستضيف
   try {

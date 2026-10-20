@@ -4,3 +4,4 @@ bin/
 *.log
 bot.log
 test-audio.ogg
+ops.local.json

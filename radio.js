@@ -33,6 +33,8 @@ let starting = false;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}] [radio]`, ...args);
+  // Also log to stderr for visibility
+  console.error(`[radio] ${args[0] || ''}`);
 }
 
 function surahUrl(n) {

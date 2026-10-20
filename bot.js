@@ -52,6 +52,10 @@ const CHAT_ENABLED = String(process.env.CHAT_ENABLED || 'true').toLowerCase() !=
 const MSG_CONTENT =
   String(process.env.ENABLE_MESSAGE_CONTENT || 'false').toLowerCase() === 'true';
 
+// رتبة العضو الافتراضية للأعضاء الجدد
+const MEMBER_ROLE_NAME = (process.env.MEMBER_ROLE_NAME || 'عضو').trim();
+const MEMBER_ROLE_ID = (process.env.MEMBER_ROLE_ID || '').trim();
+
 // حالة كل سيرفر على حدة — البوت يخدم أكثر من سيرفر في نفس الوقت
 // الرد الصوتي: الافتراضي من الإعدادات، وكل سيرفر له حالته (تشغيل/إيقاف مستقل)
 const VOICE_CHAT_DEFAULT = String(process.env.VOICE_CHAT || 'true').toLowerCase() !== 'false';
@@ -111,6 +115,8 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
+    // لازم لاستقبال الأعضاء الجدد وإعطائهم رتبة "عضو"
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
     // اختياري: يخلي البوت يقرأ كل الرسائل (يحتاج تفعيله في بوابة المطورين)
     ...(MSG_CONTENT ? [GatewayIntentBits.MessageContent] : []),
@@ -1192,6 +1198,26 @@ client.on('guildCreate', (guild) => {
   }
 });
 
+// إعطاء العضو الجديد رتبة "عضو" تلقائياً 👤
+client.on('guildMemberAdd', async (member) => {
+  if (!member.guild || member.user.bot) return;
+  const role =
+    (MEMBER_ROLE_ID && member.guild.roles.cache.get(MEMBER_ROLE_ID)) ||
+    member.guild.roles.cache.find(
+      (r) => !r.managed && r.name === MEMBER_ROLE_NAME,
+    );
+  if (!role) {
+    log(`⚠️ رتبة العضو (${MEMBER_ROLE_NAME}) غير موجودة في ${member.guild.name}`);
+    return;
+  }
+  try {
+    await member.roles.add(role, 'رتبة العضو الافتراضية');
+    log(`👤 أعطيت ${member.user.username} رتبة ${role.name}`);
+  } catch (e) {
+    log(`⚠️ تعذر إعطاء رتبة العضو لـ ${member.user.username}: ${e.message}`);
+  }
+});
+
 client.on('voiceStateUpdate', (oldState, newState) => {
   if (!client.user || newState.id !== client.user.id) return;
   const vState = gs(newState.guild?.id);
@@ -1379,8 +1405,8 @@ async function runMusicFromChat(message, text) {
 // ---------------------------------------------------------------------------
 // رتبة البوت في السيرفر 🎖️
 // ---------------------------------------------------------------------------
-const BOT_ROLE_NAME = (process.env.BOT_ROLE_NAME || 'بوت 24/7').trim();
-const BOT_ROLE_COLOR = (process.env.BOT_ROLE_COLOR || '#5865F2').trim();
+const BOT_ROLE_NAME = (process.env.BOT_ROLE_NAME || '🤖｜البوت').trim();
+const BOT_ROLE_COLOR = (process.env.BOT_ROLE_COLOR || '#95A5A6').trim();
 
 // الصلاحيات في رابط الدعوة (تشمل "إدارة الرتب" عشان يقدر يضبط رتبته)
 const INVITE_PERMS = 271961120;
@@ -1405,7 +1431,7 @@ async function ensureBotRole(guild) {
       role = await guild.roles.create({
         name: BOT_ROLE_NAME,
         colors: { primaryColor: BOT_ROLE_COLOR },
-        hoist: false,
+        hoist: true,
         mentionable: false,
         reason: 'رتبة البوت الرسمية',
       });

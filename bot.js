@@ -2048,7 +2048,156 @@ function callsBotByName(text) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// الهوني بوت: روم فخ للمخالفين 🍯
+// ---------------------------------------------------------------------------
+const HONEYPOT_CHANNEL_ID = (process.env.HONEYPOT_CHANNEL_ID || '').trim();
+const HONEYPOT_CHANNEL_NAME = (
+  process.env.HONEYPOT_CHANNEL_NAME || '🍯｜honeypot'
+).trim();
+const HONEYPOT_LOG_CHANNEL_ID = (process.env.HONEYPOT_LOG_CHANNEL_ID || '').trim();
+const HONEYPOT_LOG_CHANNEL_NAME = (
+  process.env.HONEYPOT_LOG_CHANNEL_NAME || '📋｜سجل-الحماية'
+).trim();
+const HONEYPOT_KICK =
+  String(process.env.HONEYPOT_KICK || 'true').toLowerCase() !== 'false';
+
+function isHoneypotChannel(channel) {
+  if (!channel) return false;
+  if (HONEYPOT_CHANNEL_ID && channel.id === HONEYPOT_CHANNEL_ID) return true;
+  return channel.name === HONEYPOT_CHANNEL_NAME;
+}
+
+function findHoneypotLogChannel(guild) {
+  if (!guild) return null;
+  if (HONEYPOT_LOG_CHANNEL_ID) {
+    const byId = guild.channels.cache.get(HONEYPOT_LOG_CHANNEL_ID);
+    if (byId && byId.isTextBased?.()) return byId;
+  }
+  return (
+    guild.channels.cache.find(
+      (c) => c.isTextBased?.() && c.name === HONEYPOT_LOG_CHANNEL_NAME,
+    ) ||
+    guild.channels.cache.find(
+      (c) => c.isTextBased?.() && c.name === '📋｜الإدارة',
+    ) ||
+    null
+  );
+}
+
+async function logHoneypot(message, action, detail, color) {
+  const logChannel = findHoneypotLogChannel(message.guild);
+  if (!logChannel) return;
+  const content =
+    String(message.content || '').trim().slice(0, 1000) || '(المحتوى غير متاح)';
+  const userTag = message.author.tag || message.author.username || message.author.id;
+  await logChannel
+    .send({
+      embeds: [
+        {
+          title: '🚨 محاولة في الهوني بوت',
+          description:
+            `العضو: <@${message.author.id}> (\`${userTag}\`)\n` +
+            `الروم: <#${message.channelId}>\n` +
+            `الإجراء: ${action}`,
+          color,
+          fields: [
+            { name: 'الرسالة', value: content.slice(0, 1024) },
+            { name: 'التفاصيل', value: String(detail || '—').slice(0, 1024) },
+          ],
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      allowedMentions: { parse: [] },
+    })
+    .catch((err) => log('تعذر إرسال سجل الهوني بوت:', err.message));
+}
+
+async function handleHoneypot(message) {
+  if (!message.guild || !message.author || message.author.bot) return false;
+  if (!isHoneypotChannel(message.channel)) return false;
+
+  let deleted = false;
+  try {
+    await message.delete();
+    deleted = true;
+  } catch (err) {
+    log('تعذر حذف رسالة الهوني بوت:', err.message);
+  }
+  const deletion = deleted ? 'تم حذف الرسالة.' : 'تعذر حذف الرسالة.';
+
+  const member =
+    message.member ||
+    (await message.guild.members.fetch(message.author.id).catch(() => null));
+  const isOwner = message.author.id === message.guild.ownerId;
+  const isStaff = Boolean(
+    member?.permissions?.has(PermissionFlagsBits.ManageGuild),
+  );
+
+  if (isOwner || isStaff) {
+    await logHoneypot(
+      message,
+      'تم الرصد — اختبار/إدارة (بدون طرد)',
+      `${deletion} ${
+        isOwner
+          ? 'اختبار من المالك: البوت شغال.'
+          : 'العضو من الإدارة، تم تجاهل الطرد.'
+      }`,
+      0xf1c40f,
+    );
+    return true;
+  }
+
+  if (!member) {
+    await logHoneypot(
+      message,
+      'تم الرصد — تعذر جلب العضو',
+      `${deletion} لم يتم الطرد.`,
+      0xe67e22,
+    );
+    return true;
+  }
+
+  if (!HONEYPOT_KICK) {
+    await logHoneypot(
+      message,
+      'تم الرصد — الطرد التلقائي مقفول',
+      `${deletion} HONEYPOT_KICK=false`,
+      0xe67e22,
+    );
+    return true;
+  }
+
+  try {
+    if (!member.kickable) {
+      await logHoneypot(
+        message,
+        'تم الرصد — تعذر الطرد',
+        `${deletion} رتبة البوت تحت رتبة العضو. ارفع رتبة البوت أو اطرده يدوياً.`,
+        0xe67e22,
+      );
+      return true;
+    }
+    await member.kick('Honeypot violation');
+    await logHoneypot(
+      message,
+      '✅ تم طرد العضو',
+      `${deletion} تم طرد العضو.`,
+      0x2ecc71,
+    );
+  } catch (err) {
+    await logHoneypot(
+      message,
+      'تم الرصد — فشل الطرد',
+      `${deletion} ${err.message}`,
+      0xe74c3c,
+    );
+  }
+  return true;
+}
+
 client.on('messageCreate', async (message) => {
+  if (await handleHoneypot(message)) return;
   if (!CHAT_ENABLED) return;
   try {
     if (!message.author || message.author.bot) return;

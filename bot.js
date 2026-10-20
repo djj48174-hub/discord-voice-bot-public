@@ -36,6 +36,18 @@ const { VoiceChat } = require('./voicechat');
 const admin = require('./admin');
 const profanity = require('./profanity');
 const quran = require('./quran');
+const hadith = require('./hadith');
+const radio = require('./radio');
+
+// ---------------------------------------------------------------------------
+// الدعم الفني وروم الانتظار 🆘
+// ---------------------------------------------------------------------------
+const WAITING_CHANNEL_ID = (process.env.WAITING_CHANNEL_ID || '1562222156178259969').trim();
+const SUPPORT_TEXT_CHANNEL_ID = (process.env.SUPPORT_TEXT_CHANNEL_ID || '1562222149379301426').trim();
+const STAFF_ROLE_ID = (process.env.STAFF_ROLE_ID || '1562213525563383880').trim();
+
+// الأعضاء اللي كتمناهم في روم الانتظار (عشان نفكّهم لما ينتقلون)
+const waitingMuted = new Set();
 
 // ---------------------------------------------------------------------------
 // ميزات ملغاة: صار البوت إداري فقط (لا موسيقى ولا صوت)
@@ -1131,6 +1143,10 @@ client.once('ready', async () => {
 
   // جدولة آية/ذكر كل ساعتين في روم القرآن 📖
   quran.start(client);
+  // حديث صحيح كل ساعة 🕌
+  hadith.start(client);
+  // قرآن راديو ٢٤/٧ 📻
+  radio.start(client);
 
   // فحص عملاء يوتيوب بالخلفية واختيار أول واحد شغّال
   // (يتجاوز حجب "Sign in to confirm you're not a bot")
@@ -1277,6 +1293,8 @@ async function sendWelcome(member) {
           'نوّرت السيرفر! 🎉\n\n' +
           '**خطوتك الأولى:** تطلع لك أسئلة الترحيب — جاوب عليها ' +
           '(ولد/بنت، العمر، ألعابك) وبتنفتح لك الرومات والفويسات اللي تبيها.\n\n' +
+          '🆘 تحتاج مساعدة؟ ادخل روم **🔊｜الانتظار** وتكلم مع الإدارة، ' +
+          'أو اكتب مشكلتك في **🛠️｜الدعم-الفني** أو **📩｜الشكاوى**.\n\n' +
           (rules ? `📜 اقرأ القوانين أول شي: <#${rules.id}>` : '📜 اقرأ القوانين أول شي.'),
         color: 0xf1c40f,
         thumbnail: member.user.displayAvatarURL?.({ size: 256 })
@@ -1326,6 +1344,58 @@ client.on('guildMemberAdd', async (member) => {
   } catch (e) {
     log(`⚠️ تعذر إرسال الترحيب لـ ${member.user.username}: ${e.message}`);
   }
+});
+
+// روم الانتظار: كتم تلقائي لين يجي إداري وينقله للدعم 🆘
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  if (!newState.guild || !newState.member || newState.member.user.bot) return;
+  if (!WAITING_CHANNEL_ID) return;
+
+  const member = newState.member;
+  const joined =
+    newState.channelId === WAITING_CHANNEL_ID && oldState.channelId !== WAITING_CHANNEL_ID;
+  const left =
+    oldState.channelId === WAITING_CHANNEL_ID && newState.channelId !== WAITING_CHANNEL_ID;
+
+  if (joined) {
+    const isStaff = member.permissions?.has(PermissionFlagsBits.ManageGuild);
+    if (isStaff) return;
+    try {
+      await member.voice.setMute(true, 'انتظار الدعم الفني');
+      waitingMuted.add(member.id);
+      log(`🎙️ كتمت ${member.user.username} في روم الانتظار`);
+    } catch (e) {
+      log('⚠️ تعذر كتم عضو الانتظار:', e.message);
+    }
+    try {
+      const ch = await client.channels.fetch(SUPPORT_TEXT_CHANNEL_ID).catch(() => null);
+      if (ch?.isTextBased?.()) {
+        await ch.send({
+          content:
+            `🆘 <@${member.id}> في روم الانتظار ويحتاج مساعدة.\n` +
+            (STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}>` : ''),
+          allowedMentions: { users: [member.id], roles: STAFF_ROLE_ID ? [STAFF_ROLE_ID] : [] },
+        });
+      }
+    } catch (e) {
+      log('⚠️ تعذر إرسال تنبيه الدعم:', e.message);
+    }
+    return;
+  }
+
+  if (left && waitingMuted.has(member.id)) {
+    waitingMuted.delete(member.id);
+    try {
+      await member.voice.setMute(false, 'انتقل من روم الانتظار');
+      log(`🔊 فككت كتم ${member.user.username} بعد الانتقال`);
+    } catch (e) {
+      log('⚠️ تعذر فك كتم العضو:', e.message);
+    }
+  }
+});
+
+client.on('guildMemberRemove', (member) => {
+  waitingMuted.delete(member.id);
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {

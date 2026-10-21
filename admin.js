@@ -175,14 +175,14 @@ function parseAnnounce(raw) {
 }
 
 /** إعلان بشكل فخم (إيمبد) — نفس الشكل للسلاش والكتابة */
-function buildAnnouncementEmbed(body, { member, guild } = {}) {
+function buildAnnouncementEmbed(body, { member, guild, part } = {}) {
   const icon = guild?.iconURL?.({ size: 256 }) || undefined;
   const authorName =
     member?.displayName || member?.user?.username || member?.username || guild?.name || 'الإدارة';
   const authorIcon = member?.displayAvatarURL?.({ size: 64 }) || icon;
   const embed = new EmbedBuilder()
     .setColor(0xd4af37)
-    .setTitle('📢 إعــلان')
+    .setTitle(`📢 إعــلان${part ? ` (${part})` : ''}`)
     .setDescription(`\u200b\n${body}\n\u200b`)
     .setFooter({
       text: `u7 bot • ${authorName}`,
@@ -192,6 +192,29 @@ function buildAnnouncementEmbed(body, { member, guild } = {}) {
   if (guild?.name) embed.setAuthor({ name: guild.name, ...(icon ? { iconURL: icon } : {}) });
   if (icon) embed.setThumbnail(icon);
   return embed;
+}
+
+/** يقسّم النص الطويل على أكثر من إيمبد عشان يوصل كامل */
+function announcementEmbeds(body, ctx = {}) {
+  const text = String(body || '');
+  const parts = [];
+  let rest = text;
+  while (rest.length > 4000) {
+    let cut = rest.lastIndexOf('\n', 4000);
+    if (cut < 500) cut = 4000;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n+/, '');
+  }
+  if (rest) parts.push(rest);
+  const list = parts.length ? parts : [''];
+  return list
+    .slice(0, 10)
+    .map((p, i) =>
+      buildAnnouncementEmbed(p, {
+        ...ctx,
+        part: list.length > 1 ? `${i + 1}/${list.length}` : '',
+      }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -533,12 +556,10 @@ async function cmdAnnounce(interaction) {
   const channel = interaction.options.getChannel('الروم') || interaction.channel;
   const text = interaction.options.getString('النص', true);
   await channel.send({
-    embeds: [
-      buildAnnouncementEmbed(text, {
-        member: interaction.member,
-        guild: interaction.guild,
-      }),
-    ],
+    embeds: announcementEmbeds(text, {
+      member: interaction.member,
+      guild: interaction.guild,
+    }),
     allowedMentions: { parse: ['everyone', 'roles', 'users'] },
   });
   await interaction.editReply({ content: `✅ نُشر الإعلان في <#${channel.id}>` });
@@ -661,12 +682,10 @@ async function handleText(message, rawText) {
         return '⛔ ما لقيت روم مناسب للإعلان.';
       }
       await ch.send({
-        embeds: [
-          buildAnnouncementEmbed(ann.body, {
-            member: message.member,
-            guild: message.guild,
-          }),
-        ],
+        embeds: announcementEmbeds(ann.body, {
+          member: message.member,
+          guild: message.guild,
+        }),
         allowedMentions: { parse: [] },
       });
       return `✅ نُشر الإعلان في <#${ch.id}>.`;

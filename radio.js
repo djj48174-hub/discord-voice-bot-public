@@ -1,12 +1,13 @@
 /**
- * 📻 راديو الروم الصوتي
- * يدخل الروم الصوتي ويبقى فيه (بدون تشغيل صوت افتراضياً).
+ * 📻 الروم الصوتي — اتصال مستقل لكل سيرفر
+ * البوت يدخل الروم ويبقى فيه (بدون تشغيل صوت افتراضياً).
+ * كل سيرفر له اتصاله الخاص: الدخول في سيرفر ما يطلّع البوت من السيرفر الثاني.
  *
  * أوامر:
- *   radio.start(client)                 — دخول تلقائي 24/7
- *   radio.join(client, channelId?)      — دخول أي روم (يوقف الإيقاف اليدوي)
- *   radio.leave()                       — خروج من الروم (يبقى متوقف لين join)
- *   radio.status()                      — حالة الاتصال
+ *   radio.start(client)                        — دخول تلقائي في سيرفر الروم الافتراضي
+ *   radio.join(client, channelId?, guildId?)   — دخول أي روم (يوقف الإيقاف اليدوي)
+ *   radio.leave(guildId?)                      — خروج من روم سيرفر معيّن (أو الكل)
+ *   radio.status(guildId?)                     — حالة الاتصال
  *
  * لتشغيل التلاوة الصوتية: QURAN_RADIO_AUDIO=true
  */
@@ -38,43 +39,56 @@ const SURAH_BASE = (
   'https://download.quranicaudio.com/quran/mishaari_raashid_al_3afaasee/'
 ).trim();
 
-let connection = null;
-let player = null;
-let currentFfmpeg = null;
-let currentSurah = 1;
-let currentChannelId = DEFAULT_CHANNEL_ID;
-let lastGuildId = null;
-let starting = false;
-let paused = false; // true بعد /leave — ما نرجع تلقائياً لين /join
+// guildId -> { connection, player, ffmpeg, surah, channelId, paused, starting }
+const states = new Map();
 let lastClient = null;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}] [radio]`, ...args);
 }
 
+function getState(guildId) {
+  const id = String(guildId);
+  let s = states.get(id);
+  if (!s) {
+    s = {
+      guildId: id,
+      connection: null,
+      player: null,
+      ffmpeg: null,
+      surah: 1,
+      channelId: null,
+      paused: false,
+      starting: false,
+    };
+    states.set(id, s);
+  }
+  return s;
+}
+
 function surahUrl(n) {
   return `${SURAH_BASE}${String(n).padStart(3, '0')}.mp3`;
 }
 
-function killFfmpeg() {
-  if (currentFfmpeg) {
+function killFfmpeg(s) {
+  if (s.ffmpeg) {
     try {
-      currentFfmpeg.kill('SIGKILL');
+      s.ffmpeg.kill('SIGKILL');
     } catch {
       /* ignore */
     }
-    currentFfmpeg = null;
+    s.ffmpeg = null;
   }
 }
 
-function playSurah() {
-  if (!AUDIO_ENABLED || !player) return;
-  killFfmpeg();
+function playSurah(s) {
+  if (!AUDIO_ENABLED || !s.player) return;
+  killFfmpeg(s);
 
-  const n = currentSurah;
+  const n = s.surah;
   const url = surahUrl(n);
-  currentSurah = n >= 114 ? 1 : n + 1;
-  log(`playing surah ${String(n).padStart(3, '0')}`);
+  s.surah = n >= 114 ? 1 : n + 1;
+  log(`[${s.guildId}] playing surah ${String(n).padStart(3, '0')}`);
   const proc = spawn(
     FFMPEG,
     [
@@ -91,84 +105,90 @@ function playSurah() {
     ],
     { stdio: ['ignore', 'pipe', 'ignore'] },
   );
-  currentFfmpeg = proc;
+  s.ffmpeg = proc;
 
   proc.on('error', (e) => log('ffmpeg error:', e.message));
   proc.on('close', () => {
-    if (currentFfmpeg === proc) currentFfmpeg = null;
+    if (s.ffmpeg === proc) s.ffmpeg = null;
   });
 
   const resource = createAudioResource(proc.stdout, { inputType: StreamType.Raw });
-  player.play(resource);
+  s.player.play(resource);
 }
 
-function attachPlayer(conn) {
+function attachPlayer(s, conn) {
   if (!AUDIO_ENABLED) {
-    log('الصوت ملغي — البوت يجلس في الروم بدون تشغيل');
+    log(`[${s.guildId}] الصوت ملغي — البوت يجلس في الروم بدون تشغيل`);
     return;
   }
   try {
-    if (player) player.removeAllListeners();
+    if (s.player) s.player.removeAllListeners();
   } catch {
     /* ignore */
   }
-  player = createAudioPlayer();
-  conn.subscribe(player);
+  s.player = createAudioPlayer();
+  conn.subscribe(s.player);
 
-  player.on(AudioPlayerStatus.Idle, () => {
-    playSurah();
+  s.player.on(AudioPlayerStatus.Idle, () => {
+    playSurah(s);
   });
 
-  player.on('error', (e) => {
+  s.player.on('error', (e) => {
     log('player error:', e.message);
-    killFfmpeg();
-    setTimeout(() => playSurah(), 5000);
+    killFfmpeg(s);
+    setTimeout(() => playSurah(s), 5000);
   });
 
-  playSurah();
+  playSurah(s);
 }
 
-function destroyConnection() {
-  killFfmpeg();
+function destroyState(s) {
+  killFfmpeg(s);
   try {
-    if (player) player.stop(true);
+    if (s.player) s.player.stop(true);
   } catch {
     /* ignore */
   }
-  player = null;
+  s.player = null;
   try {
-    if (connection) connection.destroy();
+    if (s.connection) s.connection.destroy();
   } catch {
     /* ignore */
   }
-  connection = null;
+  s.connection = null;
 }
 
-async function connect(client, channelId) {
+async function connect(client, channelId, guildIdHint) {
   lastClient = client;
-  const id = String(channelId || currentChannelId || DEFAULT_CHANNEL_ID);
+  const id = String(channelId || '');
+  if (!id) return false;
   const channel = await client.channels.fetch(id).catch(() => null);
   if (!channel || !channel.isVoiceBased?.()) {
-    log('ما لقيت روم قرآن راديو الصوتي:', id);
+    log('ما لقيت روم صوتي:', id);
     return false;
   }
   const guild = channel.guild;
   if (!guild) return false;
-  lastGuildId = guild.id;
+  if (guildIdHint && String(guildIdHint) !== guild.id) {
+    log('تحذير: الروم لا يتبع السيرفر المطلوب — أستخدم سيرفر الروم');
+  }
 
-  // لو البوت موجود بالروم الصحيح وما فيه اتصال سليم، نبقى على نفس الاتصال
+  const s = getState(guild.id);
+  s.channelId = channel.id;
+
+  // لو البوت موجود بنفس الروم، نعيد استخدام الاتصال
   const existing = getVoiceConnection(guild.id);
   if (existing && existing.joinConfig.channelId === channel.id) {
-    connection = existing;
-    if (!player) attachPlayer(existing);
+    s.connection = existing;
+    if (!s.player) attachPlayer(s, existing);
     return true;
   }
 
-  destroyConnection();
-  currentChannelId = channel.id;
-  log('جاري الاتصال بالروم', channel.name);
+  // نغلق اتصال هذا السيرفر فقط (السيرفرات الثانية تبقى متصلة)
+  destroyState(s);
+  log(`[${guild.id}] جاري الاتصال بالروم ${channel.name}`);
 
-  connection = joinVoiceChannel({
+  s.connection = joinVoiceChannel({
     channelId: channel.id,
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
@@ -176,131 +196,175 @@ async function connect(client, channelId) {
     selfMute: false,
   });
 
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    log('انقطع الاتصال');
+  const state = s;
+  state.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    log(`[${state.guildId}] انقطع الاتصال`);
     try {
       await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+        entersState(state.connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(state.connection, VoiceConnectionStatus.Connecting, 5000),
       ]);
     } catch {
-      log('انقطع الاتصال — إعادة محاولة');
-      // لو أحد نقله لروم ثاني نكمل فيه (ما نرجعه للروم الأول)
-      const g = client.guilds.cache.get(guild.id);
+      log(`[${state.guildId}] انقطع الاتصال — إعادة محاولة`);
+      // لو أحد نقله لروم ثاني نكمل فيه
+      const g = client.guilds.cache.get(state.guildId);
       const now = g?.members?.me?.voice?.channelId;
-      if (now) currentChannelId = now;
-      destroyConnection();
-      if (!paused) setTimeout(() => startup(client), 5000);
+      if (now) state.channelId = now;
+      destroyState(state);
+      if (!state.paused) setTimeout(() => startup(client, state.guildId), 5000);
     }
   });
 
-  connection.on('error', (e) => log('connection error:', e.message));
-  connection.on('stateChange', (o, n) =>
-    log('state', o.status, '->', n.status, n.closeCode || ''),
+  state.connection.on('error', (e) => log('connection error:', e.message));
+  state.connection.on('stateChange', (o, n) =>
+    log(`[${state.guildId}] state`, o.status, '->', n.status, n.closeCode || ''),
   );
-  if (process.env.RADIO_DEBUG) connection.on('debug', (m) => log('dbg', m));
+  if (process.env.RADIO_DEBUG) state.connection.on('debug', (m) => log('dbg', m));
 
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 20000);
-    log('متصل بالروم الصوتي', channel.name);
+    await entersState(state.connection, VoiceConnectionStatus.Ready, 20000);
+    log(`[${guild.id}] متصل بالروم الصوتي ${channel.name}`);
   } catch {
-    log('تعذر الوصول لحالة Ready — بنحاول لاحقاً');
+    log(`[${guild.id}] تعذر الوصول لحالة Ready — بنحاول لاحقاً`);
   }
 
-  attachPlayer(connection);
+  attachPlayer(state, state.connection);
   return true;
 }
 
-async function startup(client) {
-  if (starting || paused) return;
-  starting = true;
+async function startup(client, guildId) {
+  const s = getState(guildId);
+  if (s.starting || s.paused) return;
+  s.starting = true;
   try {
-    await connect(client, currentChannelId);
+    await connect(client, s.channelId || DEFAULT_CHANNEL_ID, s.guildId);
   } catch (e) {
     log('فشل التشغيل:', e.message);
   } finally {
-    starting = false;
+    s.starting = false;
   }
 }
 
-/** دخول الروم يدوياً (أو روم محدد) — يجلس فيه ويرجّع الاتصال */
-async function join(client, channelId) {
-  paused = false;
-  if (channelId) currentChannelId = String(channelId);
-  await connect(client, currentChannelId);
-  return status();
+/** دخول الروم يدوياً — لسيرفر محدد فقط، ما يمس السيرفرات الثانية */
+async function join(client, channelId, guildId) {
+  lastClient = client;
+  let gid = guildId ? String(guildId) : null;
+
+  // لو ما عطونا السيرفر، نستنتجه من الروم
+  if (!gid) {
+    const id = channelId || DEFAULT_CHANNEL_ID;
+    const ch = await client.channels.fetch(id).catch(() => null);
+    gid = ch?.guild?.id || null;
+  }
+  if (!gid) return status();
+
+  const s = getState(gid);
+  s.paused = false;
+  if (channelId) s.channelId = String(channelId);
+  await connect(client, s.channelId || DEFAULT_CHANNEL_ID, gid);
+  return status(gid);
 }
 
-/** خروج من الروم — يقفل الاتصال ويمنع الرجوع التلقائي لين join */
-function leave() {
-  paused = true;
-  destroyConnection();
-  log('خرجت من الروم (إيقاف يدوي)');
-  return status();
+/** خروج من الروم — لسيرفر محدد، أو من كل السيرفرات لو ما حددت */
+function leave(guildId) {
+  if (guildId) {
+    const s = getState(guildId);
+    s.paused = true;
+    destroyState(s);
+    log(`[${s.guildId}] خرجت من الروم (إيقاف يدوي)`);
+    return status(s.guildId);
+  }
+  for (const s of states.values()) {
+    s.paused = true;
+    destroyState(s);
+  }
+  log('خرجت من كل الرومات (إيقاف يدوي)');
+  return { paused: true };
 }
 
-/** حالة الراديو */
-function status() {
-  const st = connection?.state?.status ?? 'disconnected';
-  const chName = connection?.joinConfig?.channelId ?? null;
+/** حالة الراديو لسيرفر واحد أو ملخص الكل */
+function status(guildId) {
+  if (guildId) {
+    const s = states.get(String(guildId));
+    if (!s) {
+      return {
+        state: 'disconnected',
+        channelId: null,
+        surah: 1,
+        audio: AUDIO_ENABLED,
+        paused: false,
+        playing: false,
+      };
+    }
+    return {
+      state: s.connection?.state?.status ?? 'disconnected',
+      channelId: s.connection?.joinConfig?.channelId ?? s.channelId ?? null,
+      surah: s.surah,
+      audio: AUDIO_ENABLED,
+      paused: s.paused,
+      playing: Boolean(
+        AUDIO_ENABLED && s.player && s.player.state?.status === AudioPlayerStatus.Playing,
+      ),
+    };
+  }
   return {
-    state: st,
-    channelId: chName,
-    surah: currentSurah,
     audio: AUDIO_ENABLED,
-    paused,
-    playing: Boolean(AUDIO_ENABLED && player && player.state?.status === AudioPlayerStatus.Playing),
+    guilds: [...states.values()].map((s) => ({
+      guildId: s.guildId,
+      state: s.connection?.state?.status ?? 'disconnected',
+      channelId: s.connection?.joinConfig?.channelId ?? s.channelId ?? null,
+      paused: s.paused,
+    })),
   };
 }
 
 function start(client) {
   if (!DEFAULT_CHANNEL_ID) return;
   lastClient = client;
-  setTimeout(() => {
-    if (!paused) startup(client);
+
+  // دخول تلقائي لسيرفر الروم الافتراضي فقط
+  setTimeout(async () => {
+    const ch = await client.channels.fetch(DEFAULT_CHANNEL_ID).catch(() => null);
+    const gid = ch?.guild?.id;
+    if (gid) startup(client, gid);
   }, 5000);
 
-  // حارس كل 30 ثانية: يضمن إن البوت داخل روم صوتي والاتصال سليم.
-  // يسمح بأي روم: إذا نقله أحد لروم ثاني نكمل فيه (ما نرجعه للقرآن)،
-  // وإذا طلع من الصوت نهائياً نرجعه لآخر روم كان فيه.
+  // حارس كل 30 ثانية لكل سيرفر على حدة
   const timer = setInterval(async () => {
-    if (paused) return;
     const c = lastClient || client;
     if (!c) return;
-    try {
-      const guildId =
-        connection?.joinConfig?.guildId || lastGuildId || c.guilds?.cache?.first?.()?.id;
-      const guild = guildId ? c.guilds.cache.get(guildId) : null;
-      if (!guild) {
-        await startup(c);
-        return;
-      }
-      const whereNow = guild.members?.me?.voice?.channelId ?? null;
-      const st = connection?.state?.status;
-      const connHealthy =
-        st === VoiceConnectionStatus.Ready ||
-        st === VoiceConnectionStatus.Connecting ||
-        st === VoiceConnectionStatus.Signalling;
+    for (const s of [...states.values()]) {
+      if (s.paused) continue;
+      try {
+        const guild = c.guilds.cache.get(s.guildId);
+        if (!guild) continue;
+        const whereNow = guild.members?.me?.voice?.channelId ?? null;
+        const st = s.connection?.state?.status;
+        const connHealthy =
+          st === VoiceConnectionStatus.Ready ||
+          st === VoiceConnectionStatus.Connecting ||
+          st === VoiceConnectionStatus.Signalling;
 
-      // البوت انتقل لروم ثاني -> نكمل فيه ونعتمده كروم حالي
-      if (whereNow && whereNow !== currentChannelId) {
-        log('حارس: البوت انتقل لروم آخر — أكمل فيه');
-        currentChannelId = whereNow;
+        // انتقل لروم ثاني -> نكمل فيه
+        if (whereNow && whereNow !== s.channelId) {
+          log(`[${s.guildId}] البوت انتقل لروم آخر — أكمل فيه`);
+          s.channelId = whereNow;
+        }
+        // مو بأي روم صوتي -> نرجعه لآخر روم
+        if (!whereNow) {
+          log(`[${s.guildId}] البوت مو بأي روم صوتي — أرجعه`);
+          await startup(c, s.guildId);
+          continue;
+        }
+        // داخل روم لكن الاتصال غير سليم -> نعيد الدخول
+        if (!connHealthy) {
+          log(`[${s.guildId}] الاتصال غير سليم (${st}) — أعيد الدخول`);
+          await startup(c, s.guildId);
+        }
+      } catch (e) {
+        log('حارس: خطأ', String(e.message || e).slice(0, 120));
+        startup(c, s.guildId);
       }
-      // البوت مو بأي روم صوتي (طُرد/طلع) -> نرجعه لآخر روم كان فيه
-      if (!whereNow) {
-        log('حارس: البوت مو بأي روم صوتي — أرجعه');
-        await startup(c);
-        return;
-      }
-      // داخل روم لكن الاتصال غير سليم -> نعيد الدخول
-      if (!connHealthy) {
-        log('حارس: الاتصال غير سليم (' + st + ') — أعيد الدخول');
-        await startup(c);
-      }
-    } catch (e) {
-      log('حارس: خطأ', String(e.message || e).slice(0, 120));
-      startup(c);
     }
   }, 30 * 1000);
   if (timer.unref) timer.unref();

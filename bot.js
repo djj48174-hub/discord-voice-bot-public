@@ -1176,7 +1176,7 @@ client.once('ready', async () => {
       if (g && gs(g.id).voiceChat) {
         out.push(`- السوالف الصوتية في هذا السيرفر: ${gs(g.id).voiceOn ? 'مشغّلة (تسمع وترد بالصوت)' : 'موقفة (تشتغل بأمر صوتي)'}`);
       }
-      const r = radio.status?.();
+      const r = radio.status?.(guildId);
       if (r?.channelId) out.push('- البوت جالس في روم صوتي (بدون صوت)');
     } catch {
       /* تجاهل */
@@ -2632,7 +2632,7 @@ client.on('interactionCreate', async (interaction) => {
         interaction.member?.voice?.channel ||
         null;
       await interaction.deferReply({ ephemeral: true });
-      const s = await radio.join(client, ch?.id);
+      const s = await radio.join(client, ch?.id, interaction.guildId);
       await interaction.editReply({
         content:
           s.state === 'ready'
@@ -2645,7 +2645,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.commandName === 'leave') {
       await interaction.deferReply({ ephemeral: true });
-      radio.leave();
+      radio.leave(interaction.guildId);
       await interaction.editReply({ content: '⏹️ خرجت من الروم الصوتي. اكتب `/join` لرجوعها.' });
       return;
     }

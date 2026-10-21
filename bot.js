@@ -1177,7 +1177,7 @@ client.once('ready', async () => {
         out.push(`- السوالف الصوتية في هذا السيرفر: ${gs(g.id).voiceOn ? 'مشغّلة (تسمع وترد بالصوت)' : 'موقفة (تشتغل بأمر صوتي)'}`);
       }
       const r = radio.status?.();
-      if (r?.channelId) out.push('- التلاوة شغّالة ٢٤/٧ في روم قرآن الراديو');
+      if (r?.channelId) out.push('- البوت جالس في روم صوتي (بدون صوت)');
     } catch {
       /* تجاهل */
     }
@@ -2572,7 +2572,7 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
     new SlashCommandBuilder()
       .setName('join')
-      .setDescription('يدخّل البوت روم صوتي ويشغّل التلاوة (أي روم)')
+      .setDescription('يدخّل البوت روم صوتي ويجلس فيه (أي روم)')
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
       .addChannelOption((o) =>
         o
@@ -2582,7 +2582,7 @@ async function registerCommands() {
       ),
     new SlashCommandBuilder()
       .setName('leave')
-      .setDescription('يخرج البوت من الروم الصوتي ويوقف التلاوة')
+      .setDescription('يخرج البوت من الروم الصوتي')
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
     ...admin.buildCommands(),
     ...chat.buildCommands(),
@@ -2635,8 +2635,10 @@ client.on('interactionCreate', async (interaction) => {
       const s = await radio.join(client, ch?.id);
       await interaction.editReply({
         content:
-          s.state === 'ready' || s.playing
-            ? `✅ دخلت الروم الصوتي${ch ? ` <#${ch.id}>` : ''} — التلاوة شغّالة (سورة ${s.surah}).`
+          s.state === 'ready'
+            ? `✅ دخلت الروم الصوتي${ch ? ` <#${ch.id}>` : ''}${
+                s.audio ? ` — التلاوة شغّالة (سورة ${s.surah})` : ' — جالس بدون صوت'
+              }.`
             : `⚠️ حاولت الدخول لكن الحالة: ${s.state}. تأكد من الصلاحيات.`,
       });
       return;
@@ -2644,7 +2646,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'leave') {
       await interaction.deferReply({ ephemeral: true });
       radio.leave();
-      await interaction.editReply({ content: '⏹️ خرجت من الروم الصوتي وأوقفت التلاوة. اكتب `/join` لرجوعها.' });
+      await interaction.editReply({ content: '⏹️ خرجت من الروم الصوتي. اكتب `/join` لرجوعها.' });
       return;
     }
 

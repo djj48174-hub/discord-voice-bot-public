@@ -1,12 +1,14 @@
 /**
- * 📻 قرآن راديو — إذاعة القرآن الكريم ٢٤/٧
- * يدخل الروم الصوتي ويشغّل التلاوة باستمرار (بدون كلام).
+ * 📻 راديو الروم الصوتي
+ * يدخل الروم الصوتي ويبقى فيه (بدون تشغيل صوت افتراضياً).
  *
  * أوامر:
- *   radio.start(client)                 — تشغيل تلقائي 24/7
- *   radio.join(client, channelId?)      — دخول الروم (يوقف الإيقاف اليدوي)
+ *   radio.start(client)                 — دخول تلقائي 24/7
+ *   radio.join(client, channelId?)      — دخول أي روم (يوقف الإيقاف اليدوي)
  *   radio.leave()                       — خروج من الروم (يبقى متوقف لين join)
- *   radio.status()                      — حالة الاتصال والسورة الحالية
+ *   radio.status()                      — حالة الاتصال
+ *
+ * لتشغيل التلاوة الصوتية: QURAN_RADIO_AUDIO=true
  */
 
 'use strict';
@@ -25,6 +27,10 @@ const {
 
 const DEFAULT_CHANNEL_ID = (process.env.QURAN_RADIO_CHANNEL_ID || '1562222163140939803').trim();
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
+
+// الصوت ملغي افتراضياً: البوت يدخل الروم ويجلس بدون تشغيل.
+// لو رجعت تبي التلاوة، حط QURAN_RADIO_AUDIO=true.
+const AUDIO_ENABLED = String(process.env.QURAN_RADIO_AUDIO || 'false').toLowerCase() === 'true';
 
 // تلاوة مشاري راشد العفاسي — سورة كاملة لكل ملف
 const SURAH_BASE = (
@@ -62,7 +68,7 @@ function killFfmpeg() {
 }
 
 function playSurah() {
-  if (!player) return;
+  if (!AUDIO_ENABLED || !player) return;
   killFfmpeg();
 
   const n = currentSurah;
@@ -97,6 +103,10 @@ function playSurah() {
 }
 
 function attachPlayer(conn) {
+  if (!AUDIO_ENABLED) {
+    log('الصوت ملغي — البوت يجلس في الروم بدون تشغيل');
+    return;
+  }
   try {
     if (player) player.removeAllListeners();
   } catch {
@@ -213,7 +223,7 @@ async function startup(client) {
   }
 }
 
-/** دخول الروم يدوياً (أو روم محدد) — يشغّل التلاوة ويرجّع الاتصال */
+/** دخول الروم يدوياً (أو روم محدد) — يجلس فيه ويرجّع الاتصال */
 async function join(client, channelId) {
   paused = false;
   if (channelId) currentChannelId = String(channelId);
@@ -221,7 +231,7 @@ async function join(client, channelId) {
   return status();
 }
 
-/** خروج من الروم — يوقف التلاوة ويمنع الرجوع التلقائي لين join */
+/** خروج من الروم — يقفل الاتصال ويمنع الرجوع التلقائي لين join */
 function leave() {
   paused = true;
   destroyConnection();
@@ -237,8 +247,9 @@ function status() {
     state: st,
     channelId: chName,
     surah: currentSurah,
+    audio: AUDIO_ENABLED,
     paused,
-    playing: Boolean(player && player.state?.status === AudioPlayerStatus.Playing),
+    playing: Boolean(AUDIO_ENABLED && player && player.state?.status === AudioPlayerStatus.Playing),
   };
 }
 
@@ -249,7 +260,7 @@ function start(client) {
     if (!paused) startup(client);
   }, 5000);
 
-  // حارس كل 30 ثانية: يضمن إن البوت داخل روم صوتي والتلاوة شغالة.
+  // حارس كل 30 ثانية: يضمن إن البوت داخل روم صوتي والاتصال سليم.
   // يسمح بأي روم: إذا نقله أحد لروم ثاني نكمل فيه (ما نرجعه للقرآن)،
   // وإذا طلع من الصوت نهائياً نرجعه لآخر روم كان فيه.
   const timer = setInterval(async () => {
@@ -271,9 +282,9 @@ function start(client) {
         st === VoiceConnectionStatus.Connecting ||
         st === VoiceConnectionStatus.Signalling;
 
-      // البوت انتقل لروم ثاني -> نكمل التلاوة هناك ونعتمده كروم حالي
+      // البوت انتقل لروم ثاني -> نكمل فيه ونعتمده كروم حالي
       if (whereNow && whereNow !== currentChannelId) {
-        log('حارس: البوت انتقل لروم آخر — أكمل التلاوة فيه');
+        log('حارس: البوت انتقل لروم آخر — أكمل فيه');
         currentChannelId = whereNow;
       }
       // البوت مو بأي روم صوتي (طُرد/طلع) -> نرجعه لآخر روم كان فيه

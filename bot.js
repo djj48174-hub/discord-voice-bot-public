@@ -1157,7 +1157,7 @@ client.once('ready', async () => {
   // فحص مفتاح الذكاء الاصطناعي (لو موجود)
   chat.selfTest().catch((e) => log('تنبيه: فحص المحادثة فشل:', e.message));
 
-  // معلومات اللحظة للذكاء الاصطناعي: الروم، الأغنية الشغالة، حالة السوالف الصوتية
+  // معلومات اللحظة للذكاء الاصطناعي: الروم وحالة السوالف الصوتية
   chat.setContextProvider((userLabel, guildId) => {
     const out = [];
     try {
@@ -1176,13 +1176,8 @@ client.once('ready', async () => {
       if (g && gs(g.id).voiceChat) {
         out.push(`- السوالف الصوتية في هذا السيرفر: ${gs(g.id).voiceOn ? 'مشغّلة (تسمع وترد بالصوت)' : 'موقفة (تشتغل بأمر صوتي)'}`);
       }
-      const q = g ? music.getQueue(g.id) : null;
-      if (q?.current?.title) {
-        out.push(`- الأغنية اللي تشتغل الآن: «${q.current.title}»`);
-        if (q.songs?.length) out.push(`- بعدها في الطابور ${q.songs.length} أغنية`);
-      } else {
-        out.push('- ما فيه شي يشتغل الآن');
-      }
+      const r = radio.status?.();
+      if (r?.channelId) out.push('- التلاوة شغّالة ٢٤/٧ في روم قرآن الراديو');
     } catch {
       /* تجاهل */
     }
@@ -2667,8 +2662,6 @@ client.on('interactionCreate', async (interaction) => {
           `زمن الاستجابة: ${Math.round(client.ws.ping)}ms\n` +
           `السيرفرات: ${client.guilds.cache.size}\n` +
           `السوالف النصية: ${CHAT_ENABLED ? 'مفعّلة' : 'متوقفة'}\n` +
-          `الموسيقى: ⛔ ملغية\n` +
-          `الصوت: ⛔ ملغي\n` +
           `فلتر القذف: ✅ حذف + تايم أوت ساعة\n` +
           `الأوامر: \`/adminhelp\``,
       );

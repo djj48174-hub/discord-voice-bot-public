@@ -182,9 +182,13 @@ async function connect(client, channelId, guildIdHint) {
   const s = getState(guild.id);
   s.channelId = channel.id;
 
-  // لو البوت موجود بنفس الروم، نعيد استخدام الاتصال
+  // لو البوت متصل فعلاً بنفس الروم (Ready)، نعيد استخدام الاتصال
   const existing = getVoiceConnection(guild.id);
-  if (existing && existing.joinConfig.channelId === channel.id) {
+  if (
+    existing &&
+    existing.joinConfig.channelId === channel.id &&
+    existing.state.status === VoiceConnectionStatus.Ready
+  ) {
     s.connection = existing;
     if (!s.player) attachPlayer(s, existing);
     return true;
@@ -338,8 +342,9 @@ function start(client) {
       s.channelId = id;
       s.paused = false;
       await startup(client, gid);
+      await new Promise((r) => setTimeout(r, 1500));
     }
-  }, 5000);
+  }, 10000);
 
   // حارس كل 30 ثانية لكل سيرفر على حدة
   const timer = setInterval(async () => {
@@ -352,10 +357,7 @@ function start(client) {
         if (!guild) continue;
         const whereNow = guild.members?.me?.voice?.channelId ?? null;
         const st = s.connection?.state?.status;
-        const connHealthy =
-          st === VoiceConnectionStatus.Ready ||
-          st === VoiceConnectionStatus.Connecting ||
-          st === VoiceConnectionStatus.Signalling;
+        const connHealthy = st === VoiceConnectionStatus.Ready;
 
         // انتقل لروم ثاني -> نكمل فيه
         if (whereNow && whereNow !== s.channelId) {

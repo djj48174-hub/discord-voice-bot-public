@@ -37,6 +37,7 @@ let player = null;
 let currentFfmpeg = null;
 let currentSurah = 1;
 let currentChannelId = DEFAULT_CHANNEL_ID;
+let lastGuildId = null;
 let starting = false;
 let paused = false; // true بعد /leave — ما نرجع تلقائياً لين /join
 let lastClient = null;
@@ -143,8 +144,9 @@ async function connect(client, channelId) {
   }
   const guild = channel.guild;
   if (!guild) return false;
+  lastGuildId = guild.id;
 
-  // لو فيه اتصال قديم بنفس الروم، نعيد استخدامه
+  // لو البوت موجود بالروم الصحيح وما فيه اتصال سليم، نبقى على نفس الاتصال
   const existing = getVoiceConnection(guild.id);
   if (existing && existing.joinConfig.channelId === channel.id) {
     connection = existing;
@@ -243,20 +245,44 @@ function start(client) {
     if (!paused) startup(client);
   }, 5000);
 
-  // مراقبة كل دقيقة: إذا طلع البوت أو انقطع يرجع (إلا لو /leave)
-  const timer = setInterval(() => {
+  // حارس كل 30 ثانية: نتأكد البوت داخل روم القرآن فعلاً (وإلا نرجعه)
+  // يعالج: الطرد من الروم، النقل لروم آخر (مثل AFK)، انقطاع الاتصال، تعارض الجلسات.
+  const timer = setInterval(async () => {
     if (paused) return;
+    const c = lastClient || client;
+    if (!c) return;
     try {
-      const statusNow = connection?.state?.status;
-      const healthy =
-        statusNow === VoiceConnectionStatus.Ready ||
-        statusNow === VoiceConnectionStatus.Connecting ||
-        statusNow === VoiceConnectionStatus.Signalling;
-      if (!healthy) startup(lastClient || client);
-    } catch {
-      startup(lastClient || client);
+      const guildId =
+        connection?.joinConfig?.guildId || lastGuildId || c.guilds?.cache?.first?.()?.id;
+      const guild = guildId ? c.guilds.cache.get(guildId) : null;
+      if (!guild) {
+        await startup(c);
+        return;
+      }
+      const whereNow = guild.members?.me?.voice?.channelId ?? null;
+      const st = connection?.state?.status;
+      const connHealthy =
+        st === VoiceConnectionStatus.Ready ||
+        st === VoiceConnectionStatus.Connecting ||
+        st === VoiceConnectionStatus.Signalling;
+
+      // البوت مو في روم القرآن (انتقل/طُرد) -> نطلع من الاتصال القديم وندخل من جديد
+      if (whereNow !== currentChannelId) {
+        log('حارس: البوت مو في روم القرآن — أرجعه');
+        destroyConnection();
+        await startup(c);
+        return;
+      }
+      // في الروم الصحيح لكن الاتصال غير سليم -> نعيد الدخول
+      if (!connHealthy) {
+        log('حارس: الاتصال غير سليم (' + st + ') — أعيد الدخول');
+        await startup(c);
+      }
+    } catch (e) {
+      log('حارس: خطأ', String(e.message || e).slice(0, 120));
+      startup(c);
     }
-  }, 60 * 1000);
+  }, 30 * 1000);
   if (timer.unref) timer.unref();
   return timer;
 }

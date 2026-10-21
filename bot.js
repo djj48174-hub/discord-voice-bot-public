@@ -1141,7 +1141,7 @@ client.once('ready', async () => {
     }
   }
 
-  // جدولة آية/ذكر كل ساعتين في روم القرآن 📖
+  // جدولة آية/ذكر كل ساعة في روم القرآن 📖
   quran.start(client);
   // حديث صحيح كل ساعة 🕌
   hadith.start(client);
@@ -2577,17 +2577,17 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
     new SlashCommandBuilder()
       .setName('join')
-      .setDescription('يدخّل البوت روم قرآن الراديو ويشغّل التلاوة')
+      .setDescription('يدخّل البوت روم صوتي ويشغّل التلاوة (أي روم)')
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
       .addChannelOption((o) =>
         o
           .setName('الروم')
-          .setDescription('روم صوتي محدد (افتراضي: روم قرآن الراديو)')
+          .setDescription('أي روم صوتي (افتراضي: الروم اللي أنت فيه)')
           .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice),
       ),
     new SlashCommandBuilder()
       .setName('leave')
-      .setDescription('يخرج البوت من روم قرآن الراديو ويوقف التلاوة')
+      .setDescription('يخرج البوت من الروم الصوتي ويوقف التلاوة')
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
     ...admin.buildCommands(),
     ...chat.buildCommands(),
@@ -2632,13 +2632,16 @@ client.on('interactionCreate', async (interaction) => {
   try {
     // أوامر الراديو الصوتي (دخول/خروج)
     if (interaction.commandName === 'join') {
-      const ch = interaction.options.getChannel('الروم');
+      const ch =
+        interaction.options.getChannel('الروم') ||
+        interaction.member?.voice?.channel ||
+        null;
       await interaction.deferReply({ ephemeral: true });
       const s = await radio.join(client, ch?.id);
       await interaction.editReply({
         content:
           s.state === 'ready' || s.playing
-            ? `✅ دخلت روم القرآن${ch ? ` <#${ch.id}>` : ''} — التلاوة شغّالة (سورة ${s.surah}).`
+            ? `✅ دخلت الروم الصوتي${ch ? ` <#${ch.id}>` : ''} — التلاوة شغّالة (سورة ${s.surah}).`
             : `⚠️ حاولت الدخول لكن الحالة: ${s.state}. تأكد من الصلاحيات.`,
       });
       return;
@@ -2646,7 +2649,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'leave') {
       await interaction.deferReply({ ephemeral: true });
       radio.leave();
-      await interaction.editReply({ content: '⏹️ خرجت من روم القرآن وأوقفت التلاوة. اكتب `/join` لرجوعها.' });
+      await interaction.editReply({ content: '⏹️ خرجت من الروم الصوتي وأوقفت التلاوة. اكتب `/join` لرجوعها.' });
       return;
     }
 

@@ -6,7 +6,8 @@
 'use strict';
 
 const QURAN_CHANNEL_ID = (process.env.QURAN_CHANNEL_ID || '1562213565287501844').trim();
-const INTERVAL_MS = 60 * 60 * 1000; // كل ساعة
+const MIN_GAP_MS = 55 * 60 * 1000; // ننشر إذا مر 55 دقيقة على آخر رسالة (كل ساعة تقريباً)
+const CHECK_MS = 5 * 60 * 1000; // نفحص كل 5 دقايق (ثبات حتى بعد إعادة التشغيل)
 
 const VERSES = [
   { text: 'أَلَا بِذِكْرِ اللَّهِ تَطْمَئِنُّ الْقُلُوبُ', ref: 'سورة الرعد — ٢٨' },
@@ -68,7 +69,7 @@ async function post(client, { force = false } = {}) {
   if (!force) {
     const last = await channel.messages.fetch({ limit: 1 }).catch(() => null);
     const lastAt = last?.first()?.createdTimestamp || 0;
-    if (Date.now() - lastAt < INTERVAL_MS - 60 * 1000) return;
+    if (Date.now() - lastAt < MIN_GAP_MS) return;
   }
 
   const item = next();
@@ -91,9 +92,9 @@ async function post(client, { force = false } = {}) {
 }
 
 function start(client) {
-  // أول نشر بعد دقيقة من التشغيل (لو الروم فاضي أو مر عليه وقت)
-  setTimeout(() => post(client).catch(() => {}), 60 * 1000);
-  const timer = setInterval(() => post(client).catch(() => {}), INTERVAL_MS);
+  // أول فحص بعد 30 ثانية، وبعدها كل 5 دقايق — ينشر إذا مر 55 دقيقة على آخر رسالة
+  setTimeout(() => post(client).catch(() => {}), 30 * 1000);
+  const timer = setInterval(() => post(client).catch(() => {}), CHECK_MS);
   if (timer.unref) timer.unref();
   return timer;
 }

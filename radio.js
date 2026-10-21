@@ -175,8 +175,12 @@ async function connect(client, channelId) {
       ]);
     } catch {
       log('انقطع الاتصال — إعادة محاولة');
+      // لو أحد نقله لروم ثاني نكمل فيه (ما نرجعه للروم الأول)
+      const g = client.guilds.cache.get(guild.id);
+      const now = g?.members?.me?.voice?.channelId;
+      if (now) currentChannelId = now;
       destroyConnection();
-      if (!paused) setTimeout(() => startup(client), 10000);
+      if (!paused) setTimeout(() => startup(client), 5000);
     }
   });
 
@@ -245,8 +249,9 @@ function start(client) {
     if (!paused) startup(client);
   }, 5000);
 
-  // حارس كل 30 ثانية: نتأكد البوت داخل روم القرآن فعلاً (وإلا نرجعه)
-  // يعالج: الطرد من الروم، النقل لروم آخر (مثل AFK)، انقطاع الاتصال، تعارض الجلسات.
+  // حارس كل 30 ثانية: يضمن إن البوت داخل روم صوتي والتلاوة شغالة.
+  // يسمح بأي روم: إذا نقله أحد لروم ثاني نكمل فيه (ما نرجعه للقرآن)،
+  // وإذا طلع من الصوت نهائياً نرجعه لآخر روم كان فيه.
   const timer = setInterval(async () => {
     if (paused) return;
     const c = lastClient || client;
@@ -266,14 +271,18 @@ function start(client) {
         st === VoiceConnectionStatus.Connecting ||
         st === VoiceConnectionStatus.Signalling;
 
-      // البوت مو في روم القرآن (انتقل/طُرد) -> نطلع من الاتصال القديم وندخل من جديد
-      if (whereNow !== currentChannelId) {
-        log('حارس: البوت مو في روم القرآن — أرجعه');
-        destroyConnection();
+      // البوت انتقل لروم ثاني -> نكمل التلاوة هناك ونعتمده كروم حالي
+      if (whereNow && whereNow !== currentChannelId) {
+        log('حارس: البوت انتقل لروم آخر — أكمل التلاوة فيه');
+        currentChannelId = whereNow;
+      }
+      // البوت مو بأي روم صوتي (طُرد/طلع) -> نرجعه لآخر روم كان فيه
+      if (!whereNow) {
+        log('حارس: البوت مو بأي روم صوتي — أرجعه');
         await startup(c);
         return;
       }
-      // في الروم الصحيح لكن الاتصال غير سليم -> نعيد الدخول
+      // داخل روم لكن الاتصال غير سليم -> نعيد الدخول
       if (!connHealthy) {
         log('حارس: الاتصال غير سليم (' + st + ') — أعيد الدخول');
         await startup(c);

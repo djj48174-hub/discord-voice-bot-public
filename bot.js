@@ -2575,6 +2575,20 @@ client.on('messageCreate', async (message) => {
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
+    new SlashCommandBuilder()
+      .setName('join')
+      .setDescription('يدخّل البوت روم قرآن الراديو ويشغّل التلاوة')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+      .addChannelOption((o) =>
+        o
+          .setName('الروم')
+          .setDescription('روم صوتي محدد (افتراضي: روم قرآن الراديو)')
+          .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice),
+      ),
+    new SlashCommandBuilder()
+      .setName('leave')
+      .setDescription('يخرج البوت من روم قرآن الراديو ويوقف التلاوة')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
     ...admin.buildCommands(),
     ...chat.buildCommands(),
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
@@ -2616,6 +2630,26 @@ client.on('interactionCreate', async (interaction) => {
   log(`📥 أمر: /${interaction.commandName} — من ${interaction.user.tag} (${interaction.guild?.name ?? 'خاص'})`);
 
   try {
+    // أوامر الراديو الصوتي (دخول/خروج)
+    if (interaction.commandName === 'join') {
+      const ch = interaction.options.getChannel('الروم');
+      await interaction.deferReply({ ephemeral: true });
+      const s = await radio.join(client, ch?.id);
+      await interaction.editReply({
+        content:
+          s.state === 'ready' || s.playing
+            ? `✅ دخلت روم القرآن${ch ? ` <#${ch.id}>` : ''} — التلاوة شغّالة (سورة ${s.surah}).`
+            : `⚠️ حاولت الدخول لكن الحالة: ${s.state}. تأكد من الصلاحيات.`,
+      });
+      return;
+    }
+    if (interaction.commandName === 'leave') {
+      await interaction.deferReply({ ephemeral: true });
+      radio.leave();
+      await interaction.editReply({ content: '⏹️ خرجت من روم القرآن وأوقفت التلاوة. اكتب `/join` لرجوعها.' });
+      return;
+    }
+
     // أوامر الإدارة أولاً (حظر/طرد/تايم أوت/مسح/قفل/رتب/إعلانات)
     const adminHandled = await admin.handleInteraction(interaction);
     if (adminHandled) return;

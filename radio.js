@@ -1,6 +1,12 @@
 /**
  * 📻 قرآن راديو — إذاعة القرآن الكريم ٢٤/٧
  * يدخل الروم الصوتي ويشغّل التلاوة باستمرار (بدون كلام).
+ *
+ * أوامر:
+ *   radio.start(client)                 — تشغيل تلقائي 24/7
+ *   radio.join(client, channelId?)      — دخول الروم (يوقف الإيقاف اليدوي)
+ *   radio.leave()                       — خروج من الروم (يبقى متوقف لين join)
+ *   radio.status()                      — حالة الاتصال والسورة الحالية
  */
 
 'use strict';
@@ -8,6 +14,7 @@
 const { spawn } = require('child_process');
 const {
   joinVoiceChannel,
+  getVoiceConnection,
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
@@ -16,7 +23,7 @@ const {
   entersState,
 } = require('@discordjs/voice');
 
-const CHANNEL_ID = (process.env.QURAN_RADIO_CHANNEL_ID || '1562222163140939803').trim();
+const DEFAULT_CHANNEL_ID = (process.env.QURAN_RADIO_CHANNEL_ID || '1562222163140939803').trim();
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
 // تلاوة مشاري راشد العفاسي — سورة كاملة لكل ملف
@@ -29,12 +36,13 @@ let connection = null;
 let player = null;
 let currentFfmpeg = null;
 let currentSurah = 1;
+let currentChannelId = DEFAULT_CHANNEL_ID;
 let starting = false;
+let paused = false; // true بعد /leave — ما نرجع تلقائياً لين /join
+let lastClient = null;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}] [radio]`, ...args);
-  // Also log to stderr for visibility
-  console.error(`[radio] ${args[0] || ''}`);
 }
 
 function surahUrl(n) {
@@ -88,6 +96,11 @@ function playSurah() {
 }
 
 function attachPlayer(conn) {
+  try {
+    if (player) player.removeAllListeners();
+  } catch {
+    /* ignore */
+  }
   player = createAudioPlayer();
   conn.subscribe(player);
 
@@ -104,16 +117,45 @@ function attachPlayer(conn) {
   playSurah();
 }
 
-async function connect(client) {
-  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
+function destroyConnection() {
+  killFfmpeg();
+  try {
+    if (player) player.stop(true);
+  } catch {
+    /* ignore */
+  }
+  player = null;
+  try {
+    if (connection) connection.destroy();
+  } catch {
+    /* ignore */
+  }
+  connection = null;
+}
+
+async function connect(client, channelId) {
+  lastClient = client;
+  const id = String(channelId || currentChannelId || DEFAULT_CHANNEL_ID);
+  const channel = await client.channels.fetch(id).catch(() => null);
   if (!channel || !channel.isVoiceBased?.()) {
-    log('ما لقيت روم قرآن راديو الصوتي:', CHANNEL_ID);
-    return;
+    log('ما لقيت روم قرآن راديو الصوتي:', id);
+    return false;
   }
   const guild = channel.guild;
-  if (!guild) return;
+  if (!guild) return false;
 
+  // لو فيه اتصال قديم بنفس الروم، نعيد استخدامه
+  const existing = getVoiceConnection(guild.id);
+  if (existing && existing.joinConfig.channelId === channel.id) {
+    connection = existing;
+    if (!player) attachPlayer(existing);
+    return true;
+  }
+
+  destroyConnection();
+  currentChannelId = channel.id;
   log('جاري الاتصال بالروم', channel.name);
+
   connection = joinVoiceChannel({
     channelId: channel.id,
     guildId: guild.id,
@@ -131,18 +173,15 @@ async function connect(client) {
       ]);
     } catch {
       log('انقطع الاتصال — إعادة محاولة');
-      try {
-        connection.destroy();
-      } catch {
-        /* ignore */
-      }
-      connection = null;
-      setTimeout(() => startup(client), 10000);
+      destroyConnection();
+      if (!paused) setTimeout(() => startup(client), 10000);
     }
   });
 
   connection.on('error', (e) => log('connection error:', e.message));
-  connection.on('stateChange', (o, n) => log('state', o.status, '->', n.status, n.closeCode || ''));
+  connection.on('stateChange', (o, n) =>
+    log('state', o.status, '->', n.status, n.closeCode || ''),
+  );
   if (process.env.RADIO_DEBUG) connection.on('debug', (m) => log('dbg', m));
 
   try {
@@ -153,13 +192,14 @@ async function connect(client) {
   }
 
   attachPlayer(connection);
+  return true;
 }
 
 async function startup(client) {
-  if (starting) return;
+  if (starting || paused) return;
   starting = true;
   try {
-    await connect(client);
+    await connect(client, currentChannelId);
   } catch (e) {
     log('فشل التشغيل:', e.message);
   } finally {
@@ -167,25 +207,58 @@ async function startup(client) {
   }
 }
 
-function start(client) {
-  if (!CHANNEL_ID) return;
-  setTimeout(() => startup(client), 5000);
+/** دخول الروم يدوياً (أو روم محدد) — يشغّل التلاوة ويرجّع الاتصال */
+async function join(client, channelId) {
+  paused = false;
+  if (channelId) currentChannelId = String(channelId);
+  await connect(client, currentChannelId);
+  return status();
+}
 
-  // مراقبة كل دقيقة: إذا طلع البوت أو انقطع يرجع
+/** خروج من الروم — يوقف التلاوة ويمنع الرجوع التلقائي لين join */
+function leave() {
+  paused = true;
+  destroyConnection();
+  log('خرجت من الروم (إيقاف يدوي)');
+  return status();
+}
+
+/** حالة الراديو */
+function status() {
+  const st = connection?.state?.status ?? 'disconnected';
+  const chName = connection?.joinConfig?.channelId ?? null;
+  return {
+    state: st,
+    channelId: chName,
+    surah: currentSurah,
+    paused,
+    playing: Boolean(player && player.state?.status === AudioPlayerStatus.Playing),
+  };
+}
+
+function start(client) {
+  if (!DEFAULT_CHANNEL_ID) return;
+  lastClient = client;
+  setTimeout(() => {
+    if (!paused) startup(client);
+  }, 5000);
+
+  // مراقبة كل دقيقة: إذا طلع البوت أو انقطع يرجع (إلا لو /leave)
   const timer = setInterval(() => {
+    if (paused) return;
     try {
-      const status = connection?.state?.status;
+      const statusNow = connection?.state?.status;
       const healthy =
-        status === VoiceConnectionStatus.Ready ||
-        status === VoiceConnectionStatus.Connecting ||
-        status === VoiceConnectionStatus.Signalling;
-      if (!healthy) startup(client);
+        statusNow === VoiceConnectionStatus.Ready ||
+        statusNow === VoiceConnectionStatus.Connecting ||
+        statusNow === VoiceConnectionStatus.Signalling;
+      if (!healthy) startup(lastClient || client);
     } catch {
-      startup(client);
+      startup(lastClient || client);
     }
   }, 60 * 1000);
   if (timer.unref) timer.unref();
   return timer;
 }
 
-module.exports = { start };
+module.exports = { start, join, leave, status, DEFAULT_CHANNEL_ID };

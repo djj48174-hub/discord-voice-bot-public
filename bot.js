@@ -2260,12 +2260,13 @@ async function runVoiceCommand(guild, rawText) {
 // ---------------------------------------------------------------------------
 /** هل الرسالة تنادي البوت باسمه؟ */
 function callsBotByName(text) {
-  const t = String(text || '').toLowerCase();
+  const t = String(text || '').trim();
   if (!t) return false;
-  if (t.includes('بوت')) return true;
-  if (/bot\s*24\s*\/?\s*7/.test(t)) return true;
-  if (/\bbot\b/.test(t) && t.length < 60) return true; // "بوت" المكتوبة بحروف انجليزية
-  return false;
+  // يناديه بالاسم في بداية الرسالة فقط (عشان ما يرد على كل من كتب «بوت» في كلامه)
+  return (
+    /^(?:يا\s+)?(?:بوت|bot)(?:\s|$|[،,.!?])/i.test(t) ||
+    /^(?:يا\s+)?u7\s*bot(?:\s|$|[،,.!?])/i.test(t)
+  );
 }
 
 // ---------------------------------------------------------------------------

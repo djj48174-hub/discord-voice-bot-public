@@ -152,6 +152,48 @@ async function resolveMember(guild, ref) {
   );
 }
 
+/** يفهم طلب «ارسل اعلان [في روم X]: النص» */
+function parseAnnounce(raw) {
+  let m = String(raw || '').match(
+    /^(?:ارسل|أرسل|ابعث|انشر)\s+(?:إعلان|اعلان|إعلانا|إعلاناً)\s*([\s\S]*)$/u,
+  );
+  if (!m) m = String(raw || '').match(/^(?:أعلن|اعلن)\s+([\s\S]*)$/u);
+  if (!m) return null;
+  let rest = m[1].trim();
+  let channelRef = null;
+  if (rest) {
+    const cm = rest.match(/^(?:في|ب|على|إلى|الى)\s+(.+?)\s*[:：]\s*([\s\S]+)$/u);
+    if (cm && !/^عن\s/u.test(cm[1])) {
+      channelRef = cm[1].replace(/^(?:ال)?(?:روم|قناة|تشانل)\s*/u, '').trim();
+      rest = cm[2].trim();
+    } else {
+      rest = rest.replace(/^[:：]\s*/u, '').trim();
+    }
+  }
+  rest = rest.replace(/^عن\s+/u, '').trim();
+  return { channelRef, body: rest };
+}
+
+/** إعلان بشكل فخم (إيمبد) — نفس الشكل للسلاش والكتابة */
+function buildAnnouncementEmbed(body, { member, guild } = {}) {
+  const icon = guild?.iconURL?.({ size: 256 }) || undefined;
+  const authorName =
+    member?.displayName || member?.user?.username || member?.username || guild?.name || 'الإدارة';
+  const authorIcon = member?.displayAvatarURL?.({ size: 64 }) || icon;
+  const embed = new EmbedBuilder()
+    .setColor(0xd4af37)
+    .setTitle('📢 إعــلان')
+    .setDescription(`\u200b\n${body}\n\u200b`)
+    .setFooter({
+      text: `u7 bot • ${authorName}`,
+      ...(authorIcon ? { iconURL: authorIcon } : {}),
+    })
+    .setTimestamp(new Date());
+  if (guild?.name) embed.setAuthor({ name: guild.name, ...(icon ? { iconURL: icon } : {}) });
+  if (icon) embed.setThumbnail(icon);
+  return embed;
+}
+
 // ---------------------------------------------------------------------------
 // أوامر السلاش
 // ---------------------------------------------------------------------------
@@ -492,12 +534,10 @@ async function cmdAnnounce(interaction) {
   const text = interaction.options.getString('النص', true);
   await channel.send({
     embeds: [
-      new EmbedBuilder()
-        .setTitle('📢 إعلان')
-        .setDescription(text)
-        .setColor(0xf1c40f)
-        .setFooter({ text: `بواسطة ${interaction.user.tag}` })
-        .setTimestamp(new Date()),
+      buildAnnouncementEmbed(text, {
+        member: interaction.member,
+        guild: interaction.guild,
+      }),
     ],
     allowedMentions: { parse: ['everyone', 'roles', 'users'] },
   });
@@ -574,7 +614,8 @@ async function cmdHelp(interaction) {
         '**عام**\n' +
         '`/announce` إعلان\n`/userinfo` معلومات عضو\n`/serverinfo` معلومات السيرفر\n\n' +
         '**إرسال لروم معيّن**\n' +
-        '`ارسل في #اسم-الروم: النص` — أو عبر `/chat` اكتب نفس الطلب\n\n' +
+        '`ارسل في #اسم-الروم: النص` — أو عبر `/chat` اكتب نفس الطلب\n' +
+        '`ارسل اعلان: النص` — إعلان فخم في روم الإعلانات\n\n' +
         '**بالكتابة:** منشن البوت + طلبك، مثال: `@Bot ميوت @فلان 60` أو `@Bot امسح 20`.\n' +
         'ونفس الأوامر تشتغل من `/chat` بدون منشن.',
     );
@@ -587,7 +628,8 @@ async function cmdHelp(interaction) {
 // ---------------------------------------------------------------------------
 async function handleText(message, rawText) {
   if (!message.guild || !message.member) return null;
-  const text = String(rawText || '').replace(/\s+/g, ' ').trim();
+  const raw = String(rawText || '').trim();
+  const text = raw.replace(/\s+/g, ' ').trim();
   if (!text) return null;
 
   let target = message.mentions?.members?.first?.() || null;
@@ -601,6 +643,35 @@ async function handleText(message, rawText) {
     .trim();
 
   try {
+    // إعلان فخم: «ارسل اعلان [في روم X]: النص»
+    const ann = parseAnnounce(raw);
+    if (ann) {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+        return '⛔ تحتاج صلاحية إدارة الرسائل عشان ترسل إعلان.';
+      }
+      if (!ann.body) return 'اكتب نص الإعلان بعد «ارسل اعلان:».';
+      let ch = null;
+      if (ann.channelRef) {
+        ch = resolveChannel(message.guild, ann.channelRef);
+        if (!ch) return `ما لقيت روم باسم «${ann.channelRef}».`;
+      } else {
+        ch = resolveChannel(message.guild, 'الإعلانات') || message.channel;
+      }
+      if (!ch?.isTextBased?.() || typeof ch.send !== 'function') {
+        return '⛔ ما لقيت روم مناسب للإعلان.';
+      }
+      await ch.send({
+        embeds: [
+          buildAnnouncementEmbed(ann.body, {
+            member: message.member,
+            guild: message.guild,
+          }),
+        ],
+        allowedMentions: { parse: [] },
+      });
+      return `✅ نُشر الإعلان في <#${ch.id}>.`;
+    }
+
     // إرسال رسالة/شيء إلى روم معيّن: «ارسل في روم الشكاوى: النص»
     const sendMatch = text.match(
       /^(?:ارسل|أرسل|ابعث|ابعت|انشر|اكتب|قل)\s+(?:رسالة|رساله|شي|شيء)?\s*(?:في|ب|على|إلى|الى|لـ|ل)?\s*(?:روم|قناة|تشانل|channel)?\s*(.+?)\s*[:：]\s*([\s\S]+)$/,

@@ -215,6 +215,23 @@ const healthServer = http.createServer(async (req, res) => {
         return;
       }
 
+      // تحكّم صوتي للفحص (join/leave/status) — لكل سيرفر على حدة
+      if (u.searchParams.get('radio')) {
+        const action = String(u.searchParams.get('radio'));
+        const gid = u.searchParams.get('guild') || undefined;
+        let out;
+        if (action === 'join') {
+          out = await radio.join(client, u.searchParams.get('channel') || '', gid);
+        } else if (action === 'leave') {
+          out = radio.leave(gid || null);
+        } else {
+          out = radio.status(gid);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, radio: out }, null, 2));
+        return;
+      }
+
       // تشغيل صوت تجريبي في الروم الصوتي (لتشخيص مشكلة عدم سماع الرد)
       if (u.searchParams.get('play') === '1') {
         const send = (obj, code = 200) => {

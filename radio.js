@@ -27,6 +27,12 @@ const {
 } = require('@discordjs/voice');
 
 const DEFAULT_CHANNEL_ID = (process.env.QURAN_RADIO_CHANNEL_ID || '1562222163140939803').trim();
+
+// رومات الدخول التلقائي (لكل سيرفر على حدة) — مفصولة بفاصلة
+const AUTO_JOIN_IDS = (process.env.AUTO_JOIN_VOICE_IDS || DEFAULT_CHANNEL_ID)
+  .split(/[,\s]+/)
+  .map((s) => s.trim())
+  .filter(Boolean);
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
 // الصوت ملغي افتراضياً: البوت يدخل الروم ويجلس بدون تشغيل.
@@ -319,14 +325,20 @@ function status(guildId) {
 }
 
 function start(client) {
-  if (!DEFAULT_CHANNEL_ID) return;
+  if (!AUTO_JOIN_IDS.length) return;
   lastClient = client;
 
-  // دخول تلقائي لسيرفر الروم الافتراضي فقط
+  // دخول تلقائي لكل الرومات المحددة (كل سيرفر له اتصاله المستقل)
   setTimeout(async () => {
-    const ch = await client.channels.fetch(DEFAULT_CHANNEL_ID).catch(() => null);
-    const gid = ch?.guild?.id;
-    if (gid) startup(client, gid);
+    for (const id of AUTO_JOIN_IDS) {
+      const ch = await client.channels.fetch(id).catch(() => null);
+      const gid = ch?.guild?.id;
+      if (!gid) continue;
+      const s = getState(gid);
+      s.channelId = id;
+      s.paused = false;
+      await startup(client, gid);
+    }
   }, 5000);
 
   // حارس كل 30 ثانية لكل سيرفر على حدة

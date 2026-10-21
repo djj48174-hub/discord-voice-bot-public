@@ -49,6 +49,7 @@ const envVars = [
   { key: 'HADITH_CHANNEL_ID', value: '1562222160104394843' },
   { key: 'QURAN_RADIO_CHANNEL_ID', value: '1562222163140939803' },
   { key: 'AUTO_JOIN_VOICE_IDS', value: '1562222163140939803,1562032331110355004' },
+  { key: 'ENABLE_MESSAGE_CONTENT', value: 'true' },
 ].filter((v) => v.value !== undefined && v.value !== null && String(v.value) !== '');
 
 (async () => {

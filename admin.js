@@ -99,6 +99,59 @@ function ephemeral(content) {
   return { content, ephemeral: true, allowedMentions: { parse: [] } };
 }
 
+// تنظيف الاسم للمقارنة (يشيل الإيموجي والفواصل والمسافات)
+function normName(s) {
+  return String(s || '')
+    .replace(/[^\p{L}\p{N}]+/gu, '')
+    .toLowerCase();
+}
+
+/** يلقى روم بالمنشن أو الاسم أو المعرف */
+function resolveChannel(guild, ref) {
+  if (!guild) return null;
+  const raw = String(ref || '').trim();
+  if (!raw) return null;
+  const idm = raw.match(/^<#(\d{15,25})>$/) || raw.match(/^(\d{15,25})$/);
+  if (idm) return guild.channels.cache.get(idm[1]) || null;
+  const want = normName(
+    raw.replace(/^#/, '').replace(/^(?:ال)?(?:روم|قناة|تشانل)\s*/, ''),
+  );
+  if (!want) return null;
+  const wants = [want];
+  if (want.startsWith('ال')) wants.push(want.slice(2));
+  const textChannels = [...guild.channels.cache.values()].filter((c) => c.isTextBased?.());
+  for (const w of wants) {
+    // مطابقة تامة بعد التنظيف
+    const exact = textChannels.find((c) => normName(c.name) === w);
+    if (exact) return exact;
+  }
+  for (const w of wants) {
+    // مطابقة جزئية
+    const part = textChannels.find(
+      (c) => normName(c.name).includes(w) || w.includes(normName(c.name)),
+    );
+    if (part) return part;
+  }
+  return null;
+}
+
+/** يلقى عضو بالمنشن أو المعرف أو الاسم */
+async function resolveMember(guild, ref) {
+  if (!guild) return null;
+  const raw = String(ref || '').trim();
+  if (!raw) return null;
+  const idm = raw.match(/<@!?(\d{15,25})>/) || raw.match(/^(\d{15,25})$/);
+  if (idm) return await guild.members.fetch(idm[1]).catch(() => null);
+  const found = await guild.members.fetch({ query: raw, limit: 5 }).catch(() => null);
+  if (!found || !found.size) return null;
+  const want = normName(raw);
+  return (
+    found.find((m) => normName(m.displayName) === want) ||
+    found.find((m) => normName(m.user.username) === want) ||
+    found.first()
+  );
+}
+
 // ---------------------------------------------------------------------------
 // أوامر السلاش
 // ---------------------------------------------------------------------------
@@ -520,7 +573,10 @@ async function cmdHelp(interaction) {
         '`/addrole` إعطاء رتبة\n`/removerole` سحب رتبة\n\n' +
         '**عام**\n' +
         '`/announce` إعلان\n`/userinfo` معلومات عضو\n`/serverinfo` معلومات السيرفر\n\n' +
-        '**بالكتابة:** منشن البوت + طلبك، مثال: `@Bot ميوت @فلان 60` أو `@Bot امسح 20`.',
+        '**إرسال لروم معيّن**\n' +
+        '`ارسل في #اسم-الروم: النص` — أو عبر `/chat` اكتب نفس الطلب\n\n' +
+        '**بالكتابة:** منشن البوت + طلبك، مثال: `@Bot ميوت @فلان 60` أو `@Bot امسح 20`.\n' +
+        'ونفس الأوامر تشتغل من `/chat` بدون منشن.',
     );
   await interaction.editReply({ embeds: [embed] });
   return true;
@@ -534,13 +590,42 @@ async function handleText(message, rawText) {
   const text = String(rawText || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
 
-  const target = message.mentions?.members?.first() || null;
+  let target = message.mentions?.members?.first?.() || null;
+  if (!target) {
+    const idm = text.match(/<@!?(\d{15,25})>/);
+    if (idm) target = await message.guild.members.fetch(idm[1]).catch(() => null);
+  }
   const rest = text
     .replace(new RegExp(`<@!?${target?.id || '0'}>`, 'g'), ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
   try {
+    // إرسال رسالة/شيء إلى روم معيّن: «ارسل في روم الشكاوى: النص»
+    const sendMatch = text.match(
+      /^(?:ارسل|أرسل|ابعث|ابعت|انشر|اكتب|قل)\s+(?:رسالة|رساله|شي|شيء)?\s*(?:في|ب|على|إلى|الى|لـ|ل)?\s*(?:روم|قناة|تشانل|channel)?\s*(.+?)\s*[:：]\s*([\s\S]+)$/,
+    );
+    if (sendMatch) {
+      const refRaw = sendMatch[1].trim();
+      const body = sendMatch[2].trim();
+      const explicit = /(?:روم|قناة|تشانل)\s+\S/.test(text.slice(0, 40));
+      let ch = resolveChannel(message.guild, refRaw);
+      if (!ch && /^(?:هنا|هذا الروم|الروم|الشات|هذا الشات)$/.test(refRaw)) ch = message.channel;
+      if (ch) {
+        if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+          return '⛔ تحتاج صلاحية إدارة الرسائل عشان ترسل باسم البوت.';
+        }
+        if (!ch.isTextBased?.() || typeof ch.send !== 'function') {
+          return `⛔ <#${ch.id}> مو روم كتابي.`;
+        }
+        await ch.send({
+          content: body,
+          allowedMentions: { parse: ['users', 'roles'] },
+        });
+        return `✅ أرسلت في <#${ch.id}>.`;
+      }
+      if (explicit) return `ما لقيت روم باسم «${refRaw}». جرّب اسم الروم أو منشنه.`;
+    }
     // ميوت / تايم أوت
     if (/^(ميوت|كتم|اسكت|تايم ?اوت|تايم)\b/.test(text) && target) {
       if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return '⛔ تحتاج صلاحية إسكات الأعضاء.';

@@ -2489,9 +2489,41 @@ async function handleProfanity(message) {
   return true;
 }
 
+const SALAM_RE = /^[\s\p{So}\p{Sk}\u200d\uFE0F]*(?:السلام|سلام)\s*عليكم(?:\s*ورحمة\s*الله(?:\s*وبركاته)?)?/u;
+const salamAt = new Map(); // مفتاح -> آخر رد (لمنع التكرار)
+
+/** رد تلقائي على تحية السلام — يشتغل لكل من يكتب «السلام عليكم» */
+async function handleSalam(message) {
+  try {
+    if (!message?.author || message.author.bot) return false;
+    const content = message.content || '';
+    if (!SALAM_RE.test(content)) return false;
+    // لو فيه منشن للبوت، خل المحادثة ترد (عشان ما يصير ردّان)
+    if (message.client?.user && message.mentions?.has?.(message.client.user)) return false;
+    const key = `${message.guildId || 'dm'}:${message.channelId}:${message.author.id}`;
+    const now = Date.now();
+    if (now - (salamAt.get(key) || 0) < 4000) return true;
+    salamAt.set(key, now);
+    if (salamAt.size > 500) {
+      for (const [k, t] of salamAt) if (now - t > 60000) salamAt.delete(k);
+    }
+    await message.reply({
+      content: /ورحمة\s*الله/.test(content)
+        ? 'وعليكم السلام ورحمة الله وبركاته'
+        : 'وعليكم السلام',
+      allowedMentions: { parse: [], repliedUser: false },
+    });
+    return true;
+  } catch (e) {
+    log('[salam] تعذر الرد:', String(e.message).slice(0, 120));
+    return false;
+  }
+}
+
 client.on('messageCreate', async (message) => {
   if (await handleHoneypot(message)) return;
   if (await handleProfanity(message)) return;
+  if (await handleSalam(message)) return;
   if (!CHAT_ENABLED) return;
   try {
     if (!message.author || message.author.bot) return;
@@ -2670,6 +2702,28 @@ client.on('interactionCreate', async (interaction) => {
     // أوامر الإدارة أولاً (حظر/طرد/تايم أوت/مسح/قفل/رتب/إعلانات)
     const adminHandled = await admin.handleInteraction(interaction);
     if (adminHandled) return;
+
+    // /chat: ينفّذ الطلبات الفعلية أولاً (إرسال لروم، مسح، قفل…) بدون تدخل
+    if (interaction.commandName === 'chat') {
+      const raw = interaction.options.getString('الكلام') || '';
+      const pseudo = {
+        guild: interaction.guild,
+        member: interaction.member,
+        channel: interaction.channel,
+        channelId: interaction.channelId,
+        author: interaction.user,
+        mentions: {},
+      };
+      const actionReply = await admin.handleText(pseudo, raw);
+      if (actionReply) {
+        await interaction.reply({
+          content: actionReply,
+          ephemeral: true,
+          allowedMentions: { parse: [] },
+        });
+        return;
+      }
+    }
 
     // أوامر المحادثة (chat/chatreset)
     const chatHandled = await chat.handleInteraction(interaction);

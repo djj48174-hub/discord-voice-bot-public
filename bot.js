@@ -604,6 +604,8 @@ const healthServer = http.createServer(async (req, res) => {
     res.end(
       JSON.stringify({
         status: 'ok',
+        modules: Object.keys(MODULES),
+        commands: REGISTER_STATE,
         bot: client.user?.tag ?? 'starting',
         gateway: client.isReady() ? 'ready' : 'offline',
         voice,
@@ -2644,6 +2646,8 @@ client.on('messageCreate', async (message) => {
 // ---------------------------------------------------------------------------
 // أوامر السلاش
 // ---------------------------------------------------------------------------
+let REGISTER_STATE = { ok: false, count: 0, guilds: 0, error: null };
+
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder().setName('status').setDescription('يعرض حالة البوت'),
@@ -2681,6 +2685,10 @@ async function registerCommands() {
         await client.rest.put(Routes.applicationGuildCommands(client.user.id, gid), {
           body: commands,
         });
+        REGISTER_STATE.ok = true;
+        REGISTER_STATE.count = commands.length;
+        REGISTER_STATE.guilds += 1;
+        REGISTER_STATE.error = null;
         log(`تم تسجيل الأوامر في السيرفر ${gid}.`);
       } catch (e) {
         log(`تنبيه: ما قدرت أسجّل الأوامر في ${gid}: ${String(e.message).slice(0, 90)}`);

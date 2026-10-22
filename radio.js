@@ -36,8 +36,8 @@ const AUTO_JOIN_IDS = (process.env.AUTO_JOIN_VOICE_IDS || DEFAULT_CHANNEL_ID)
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
 // الصوت ملغي افتراضياً: البوت يدخل الروم ويجلس بدون تشغيل.
-// لو رجعت تبي التلاوة، حط QURAN_RADIO_AUDIO=true (أو شغّلها من لوحة التحكم في الروم).
-let audioEnabled = String(process.env.QURAN_RADIO_AUDIO || 'false').toLowerCase() === 'true';
+// لو رجعت تبي التلاوة، حط QURAN_RADIO_AUDIO=true.
+const AUDIO_ENABLED = String(process.env.QURAN_RADIO_AUDIO || 'false').toLowerCase() === 'true';
 
 // تلاوة مشاري راشد العفاسي — سورة كاملة لكل ملف
 const SURAH_BASE = (
@@ -88,7 +88,7 @@ function killFfmpeg(s) {
 }
 
 function playSurah(s) {
-  if (!audioEnabled || !s.player) return;
+  if (!AUDIO_ENABLED || !s.player) return;
   killFfmpeg(s);
 
   const n = s.surah;
@@ -123,7 +123,7 @@ function playSurah(s) {
 }
 
 function attachPlayer(s, conn) {
-  if (!audioEnabled) {
+  if (!AUDIO_ENABLED) {
     log(`[${s.guildId}] الصوت ملغي — البوت يجلس في الروم بدون تشغيل`);
     return;
   }
@@ -301,7 +301,7 @@ function status(guildId) {
         state: 'disconnected',
         channelId: null,
         surah: 1,
-        audio: audioEnabled,
+        audio: AUDIO_ENABLED,
         paused: false,
         playing: false,
       };
@@ -310,15 +310,15 @@ function status(guildId) {
       state: s.connection?.state?.status ?? 'disconnected',
       channelId: s.connection?.joinConfig?.channelId ?? s.channelId ?? null,
       surah: s.surah,
-      audio: audioEnabled,
+      audio: AUDIO_ENABLED,
       paused: s.paused,
       playing: Boolean(
-        audioEnabled && s.player && s.player.state?.status === AudioPlayerStatus.Playing,
+        AUDIO_ENABLED && s.player && s.player.state?.status === AudioPlayerStatus.Playing,
       ),
     };
   }
   return {
-    audio: audioEnabled,
+    audio: AUDIO_ENABLED,
     guilds: [...states.values()].map((s) => ({
       guildId: s.guildId,
       state: s.connection?.state?.status ?? 'disconnected',
@@ -326,43 +326,6 @@ function status(guildId) {
       paused: s.paused,
     })),
   };
-}
-
-/** تشغيل/إيقاف التلاوة الصوتية أثناء العمل بدون إعادة تشغيل البوت */
-function setAudioEnabled(on) {
-  audioEnabled = Boolean(on);
-  for (const s of states.values()) {
-    if (!audioEnabled) {
-      killFfmpeg(s);
-      try {
-        if (s.player) s.player.stop(true);
-      } catch {
-        /* ignore */
-      }
-      s.player = null;
-    } else if (s.connection && !s.player) {
-      attachPlayer(s, s.connection);
-    }
-  }
-  log(audioEnabled ? 'الصوت: تشغيل' : 'الصوت: إيقاف');
-  return audioEnabled;
-}
-
-/** تخطي السورة الحالية والانتقال للي بعدها */
-function next(guildId) {
-  const s = getState(guildId);
-  if (!s.player) return status(guildId);
-  killFfmpeg(s);
-  try {
-    s.player.stop(true);
-  } catch {
-    /* ignore */
-  }
-  return status(guildId);
-}
-
-function isAudioEnabled() {
-  return audioEnabled;
 }
 
 function start(client) {

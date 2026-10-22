@@ -12,13 +12,13 @@
 const {
   ChannelType,
   PermissionFlagsBits,
+  SlashCommandBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
 } = require('discord.js');
 
-const TRIGGER_ID = (process.env.TEMPVOICE_TRIGGER_ID || '1562320675367293018').trim();
 const CATEGORY_ID = (process.env.TEMPVOICE_CATEGORY_ID || '1562319970010931210').trim();
 const DEFAULT_LIMIT = Number(process.env.TEMPVOICE_LIMIT || 0);
 const BLUE = 0x2563eb;
@@ -234,6 +234,48 @@ async function onModal(interaction) {
   }
 }
 
+function buildCommands() {
+  return [
+    new SlashCommandBuilder().setName('room').setDescription('إنشاء روم صوتي خاص فيك'),
+    new SlashCommandBuilder()
+      .setName('tempvoice')
+      .setDescription('لوحة الفويسات المؤقتة (الإدارة)')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+      .addSubcommand((s) => s.setName('panel').setDescription('إرسال لوحة إنشاء الروم في هذا الروم')),
+  ];
+}
+
+async function handleInteraction(interaction) {
+  if (!interaction.isChatInputCommand()) return false;
+
+  if (interaction.commandName === 'room') {
+    try {
+      await createRoom(interaction);
+    } catch (err) {
+      log('room create failed:', err.message);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'ما قدرت أنشئ الروم.', ephemeral: true }).catch(() => {});
+      }
+    }
+    return true;
+  }
+
+  if (interaction.commandName === 'tempvoice') {
+    try {
+      await interaction.channel.send(panelView());
+      await interaction.reply({ content: '✅ أرسلت اللوحة.', ephemeral: true });
+    } catch (err) {
+      log('panel failed:', err.message);
+      if (!interaction.replied) {
+        await interaction.reply({ content: 'ما قدرت أرسل اللوحة.', ephemeral: true }).catch(() => {});
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
 function init(client) {
   client.on('voiceStateUpdate', (o, n) => onVoiceState(o, n).catch(() => {}));
 
@@ -248,21 +290,7 @@ function init(client) {
     }
   });
 
-  // نشر/تحديث اللوحة عند التشغيل
-  client.once('ready', async () => {
-    const ch = await client.channels.fetch(TRIGGER_ID).catch(() => null);
-    if (!ch) return log('trigger channel not found');
-
-    const recent = await ch.messages.fetch({ limit: 20 }).catch(() => null);
-    const mine = recent ? [...recent.values()].filter((m) => m.author.id === client.user.id) : [];
-    for (const old of mine) {
-      if (old.embeds[0]?.title?.includes('روم صوتي خاص')) await old.delete().catch(() => {});
-    }
-    await ch.send(panelView()).catch(() => {});
-    log('panel published');
-  });
-
   log('module ready');
 }
 
-module.exports = { init };
+module.exports = { init, buildCommands, handleInteraction };

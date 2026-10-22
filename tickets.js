@@ -18,7 +18,6 @@ const {
 
 const STAFF_ROLE_ID = (process.env.STAFF_ROLE_ID || '1562213525563383880').trim();
 const CATEGORY_ID = (process.env.TICKET_CATEGORY_ID || '1562222145948352513').trim();
-const PANEL_CHANNEL_ID = (process.env.SUPPORT_TEXT_CHANNEL_ID || '1562317869952405565').trim();
 const BLUE = 0x2563eb;
 
 function panelView() {
@@ -203,21 +202,6 @@ function init(client) {
     if (!i.isButton()) return;
     if (!String(i.customId || '').startsWith('tk:')) return;
     handleInteraction(i).catch(() => {});
-  });
-
-  // نشر لوحة الدعم تلقائياً لو ما كانت موجودة
-  client.once('ready', async () => {
-    const channel = await client.channels.fetch(PANEL_CHANNEL_ID).catch(() => null);
-    if (!channel) return console.log('[tickets] panel channel not found');
-    const recent = await channel.messages.fetch({ limit: 10 }).catch(() => null);
-    const exists =
-      recent &&
-      recent.some(
-        (m) => m.author.id === client.user.id && m.embeds[0]?.title?.includes('الدعم'),
-      );
-    if (exists) return;
-    await channel.send(panelView()).catch(() => {});
-    console.log('[tickets] panel published');
   });
 
   console.log('[tickets] ready');

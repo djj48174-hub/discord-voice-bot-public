@@ -21,7 +21,7 @@ COPY scripts ./scripts
 RUN npm install --omit=dev --no-audit --no-fund
 
 # نسخ الكود (كل وحدات البوت)
-COPY bot.js music.js chat.js voicechat.js speech.js ogg.js admin.js profanity.js quran.js hadith.js radio.js .env.example ./
+COPY bot.js music.js chat.js voicechat.js speech.js ogg.js admin.js profanity.js quran.js hadith.js radio.js levels.js giveaways.js tickets.js tempvoice.js .env.example ./
 
 # فحص إجباري: لو الأدوات ناقصة يفشل البناء بدل ما يفشل التشغيل
 RUN node -e "const {execFileSync}=require('child_process'); \

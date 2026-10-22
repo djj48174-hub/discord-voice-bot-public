@@ -49,6 +49,7 @@ for (const [name, file] of Object.entries({
   levels: './levels',
   giveaways: './giveaways',
   tickets: './tickets',
+  rules: './rules',
 })) {
   try {
     MODULES[name] = require(file);

@@ -38,6 +38,7 @@ const profanity = require('./profanity');
 const quran = require('./quran');
 const hadith = require('./hadith');
 const radio = require('./radio');
+const radioPanel = require('./radio-panel');
 
 // ---------------------------------------------------------------------------
 // الدعم الفني وروم الانتظار 🆘
@@ -143,6 +144,9 @@ const client = new Client({
     ...(MSG_CONTENT ? [GatewayIntentBits.MessageContent] : []),
   ],
 });
+
+// لوحة تحكم راديو القرآن (أزرار التشغيل/الإيقاف/السورة التالية)
+radioPanel.init(client);
 
 // ---------------------------------------------------------------------------
 // HTTP Health Check (لـ Render/Koyeb — يمنع النوم)

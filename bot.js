@@ -38,6 +38,7 @@ const profanity = require('./profanity');
 const quran = require('./quran');
 const hadith = require('./hadith');
 const radio = require('./radio');
+const guard = require('./guard');
 
 // ---------------------------------------------------------------------------
 // وحدات الميزات الإضافية (مستويات/سحوبات/تذاكر/فويس مؤقت)
@@ -1170,6 +1171,15 @@ client.once('ready', async () => {
   log(`تم تسجيل الدخول باسم ${client.user.tag} (ID: ${client.user.id})`);
   log(`البوت موجود في ${client.guilds.cache.size} سيرفر.`);
 
+  // 🛡️ نتحقق من كل سيرفر: أي سيرفر مو مصرّح له نخرج منه فورًا
+  for (const guild of [...client.guilds.cache.values()]) {
+    const ok = await guard.verify(guild, client).catch(() => false);
+    if (!ok) {
+      log(`⛔ سيرفر غير مصرّح: ${guild.name} (${guild.id}) — أخرج منه.`);
+      guild.leave().catch(() => {});
+    }
+  }
+
   try {
     const sodium = require('libsodium-wrappers');
     await sodium.ready;
@@ -1267,7 +1277,14 @@ client.once('ready', async () => {
   }
 });
 
-client.on('guildCreate', (guild) => {
+client.on('guildCreate', async (guild) => {
+  // 🛡️ ما يشتغل إلا في سيرفرات المالك — أي سيرفر ثاني يخرج منه على طول
+  const ok = await guard.verify(guild, client).catch(() => false);
+  if (!ok) {
+    log(`⛔ انضممت لسيرفر غير مصرّح: ${guild.name} (${guild.id}) — أخرج.`);
+    guild.leave().catch(() => {});
+    return;
+  }
   log(`انضممت لسيرفر جديد: ${guild.name}`);
   ensureBotRole(guild).catch(() => {});
   // نسجّل الأوامر في السيرفر الجديد فوراً، وندخل روم صوتي لو الدخول التلقائي مفعّل
@@ -1366,6 +1383,7 @@ async function sendWelcome(member) {
 // إعطاء العضو الجديد رتبة "عضو" تلقائياً 👤
 client.on('guildMemberAdd', async (member) => {
   if (!member.guild || member.user.bot) return;
+  if (!guard.isAllowed(member.guild.id)) return;
   const role =
     (MEMBER_ROLE_ID && member.guild.roles.cache.get(MEMBER_ROLE_ID)) ||
     member.guild.roles.cache.find(
@@ -1393,6 +1411,7 @@ client.on('guildMemberAdd', async (member) => {
 // روم الانتظار: كتم تلقائي لين يجي إداري وينقله للدعم 🆘
 client.on('voiceStateUpdate', async (oldState, newState) => {
   if (!newState.guild || !newState.member || newState.member.user.bot) return;
+  if (!guard.isAllowed(newState.guild.id)) return;
   if (!WAITING_CHANNEL_ID) return;
 
   const member = newState.member;
@@ -2554,6 +2573,8 @@ async function handleSalam(message) {
 }
 
 client.on('messageCreate', async (message) => {
+  // 🛡️ تجاهل أي رسالة من سيرفر غير مصرّح
+  if (message.guildId && !guard.isAllowed(message.guildId)) return;
   if (await handleHoneypot(message)) return;
   if (await handleProfanity(message)) return;
   if (await handleSalam(message)) return;
@@ -2682,7 +2703,7 @@ async function registerCommands() {
         ...client.guilds.cache.keys(),
         ...(GUILD_ID ? GUILD_ID.split(/[,\s]+/).filter(Boolean) : []),
       ]),
-    ];
+    ].filter((gid) => guard.isAllowed(gid));
     for (const gid of guildIds) {
       try {
         await client.rest.put(Routes.applicationGuildCommands(client.user.id, gid), {
@@ -2698,12 +2719,12 @@ async function registerCommands() {
       }
     }
 
-    // 2) نسجّل نسخة عامة كمان (تظهر بأي سيرفر جديد ينضم له البوت لاحقاً)
+    // 2) نمسح الأوامر العامة القديمة (كانت تظهر بأي سيرفر) — الأوامر الآن لكل سيرفر مصرّح فقط
     try {
-      await client.rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-      log('تم تسجيل الأوامر عالميًا (تظهر بأي سيرفر جديد).');
+      await client.rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+      log('تم مسح الأوامر العامة (ما تظهر إلا في السيرفرات المصرّح لها).');
     } catch (e) {
-      log('تنبيه: ما قدرت أسجّل الأوامر العامة:', String(e.message).slice(0, 90));
+      log('تنبيه: ما قدرت أمسح الأوامر العامة:', String(e.message).slice(0, 90));
     }
   } catch (err) {
     log('ما قدرت أسجّل أوامر السلاش:', err.message);
@@ -2711,6 +2732,8 @@ async function registerCommands() {
 }
 
 client.on('interactionCreate', async (interaction) => {
+  // 🛡️ تجاهل أي أمر من سيرفر غير مصرّح
+  if (interaction.guildId && !guard.isAllowed(interaction.guildId)) return;
   if (!interaction.isChatInputCommand()) return;
 
   log(`📥 أمر: /${interaction.commandName} — من ${interaction.user.tag} (${interaction.guild?.name ?? 'خاص'})`);

@@ -40,6 +40,24 @@ const hadith = require('./hadith');
 const radio = require('./radio');
 
 // ---------------------------------------------------------------------------
+// وحدات الميزات الإضافية (مستويات/سحوبات/تذاكر/فويس مؤقت)
+// كل وحدة معزولة: لو وحدة فشلت ما توقف البوت.
+// ---------------------------------------------------------------------------
+const MODULES = {};
+for (const [name, file] of Object.entries({
+  tempvoice: './tempvoice',
+  levels: './levels',
+  giveaways: './giveaways',
+  tickets: './tickets',
+})) {
+  try {
+    MODULES[name] = require(file);
+  } catch (err) {
+    console.error(`[modules] فشل تحميل ${name}:`, err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // الدعم الفني وروم الانتظار 🆘
 // ---------------------------------------------------------------------------
 const WAITING_CHANNEL_ID = (process.env.WAITING_CHANNEL_ID || '1562222156178259969').trim();
@@ -143,6 +161,15 @@ const client = new Client({
     ...(MSG_CONTENT ? [GatewayIntentBits.MessageContent] : []),
   ],
 });
+
+// تشغيل الوحدات الإضافية (كل وحدة داخل try/catch)
+for (const [name, mod] of Object.entries(MODULES)) {
+  try {
+    if (typeof mod.init === 'function') mod.init(client);
+  } catch (err) {
+    console.error(`[modules] فشل تشغيل ${name}:`, err.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP Health Check (لـ Render/Koyeb — يمنع النوم)
@@ -2636,6 +2663,9 @@ async function registerCommands() {
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
     ...admin.buildCommands(),
     ...chat.buildCommands(),
+    ...Object.values(MODULES).flatMap((m) =>
+      typeof m.buildCommands === 'function' ? m.buildCommands() : [],
+    ),
   ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));
 
   try {
@@ -2729,6 +2759,17 @@ client.on('interactionCreate', async (interaction) => {
     // أوامر المحادثة (chat/chatreset)
     const chatHandled = await chat.handleInteraction(interaction);
     if (chatHandled) return;
+
+    // وحدات الميزات الإضافية (مستويات/سحوبات/تذاكر)
+    for (const [name, mod] of Object.entries(MODULES)) {
+      if (typeof mod.handleInteraction !== 'function') continue;
+      try {
+        const handled = await mod.handleInteraction(interaction);
+        if (handled) return;
+      } catch (err) {
+        log(`[modules] خطأ في ${name}:`, err.message);
+      }
+    }
 
     if (interaction.commandName === 'status') {
       await interaction.reply(

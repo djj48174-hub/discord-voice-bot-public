@@ -1282,6 +1282,8 @@ client.on('guildCreate', (guild) => {
 
 // الترحيب بالأعضاء الجدد 👋
 const WELCOME_CHANNEL_ID = (process.env.WELCOME_CHANNEL_ID || '').trim();
+// الترحيب التلقائي معطّل افتراضياً — يُرسل فقط بأمر /welcome
+const WELCOME_ON_JOIN = String(process.env.WELCOME_ON_JOIN || 'false').toLowerCase() === 'true';
 const WELCOME_CHANNEL_NAME = (
   process.env.WELCOME_CHANNEL_NAME || '👋｜الترحيب'
 ).trim();
@@ -1381,7 +1383,7 @@ client.on('guildMemberAdd', async (member) => {
   }
 
   try {
-    await sendWelcome(member);
+    if (WELCOME_ON_JOIN) await sendWelcome(member);
     log(`👋 رحّبت بـ ${member.user.username} في ${member.guild.name}`);
   } catch (e) {
     log(`⚠️ تعذر إرسال الترحيب لـ ${member.user.username}: ${e.message}`);

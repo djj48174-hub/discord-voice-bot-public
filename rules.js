@@ -19,6 +19,8 @@ const {
 
 const UNVERIFIED_ROLE_ID = (process.env.UNVERIFIED_ROLE_ID || '1562301170603655218').trim();
 const MEMBER_ROLE_ID = (process.env.MEMBER_ROLE_ID || '1562302309919359067').trim();
+const WELCOME_CHANNEL_ID = (process.env.WELCOME_CHANNEL_ID || '1562213580529475675').trim();
+const RULES_CHANNEL_ID = (process.env.RULES_CHANNEL_ID || '1562213576368726178').trim();
 const BLUE = 0x2563eb;
 
 const RULES = [
@@ -64,6 +66,11 @@ function buildCommands() {
       .addSubcommand((s) =>
         s.setName('panel').setDescription('إرسال رسالة القوانين وزر الموافقة في هذا الروم'),
       ),
+    new SlashCommandBuilder()
+      .setName('welcome')
+      .setDescription('إرسال ترحيب لعضو (يدوي)')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+      .addUserOption((o) => o.setName('user').setDescription('العضو').setRequired(true)),
   ];
 }
 
@@ -93,7 +100,45 @@ async function onButton(interaction) {
 
 async function handleInteraction(interaction) {
   if (interaction.isButton()) return onButton(interaction);
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'rules') return false;
+  if (!interaction.isChatInputCommand()) return false;
+
+  if (interaction.commandName === 'welcome') {
+    try {
+      const user = interaction.options.getUser('user');
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      const channel = await interaction.guild.channels.fetch(WELCOME_CHANNEL_ID).catch(() => null);
+      if (!channel || !member) {
+        await interaction.reply({ content: 'ما لقيت العضو أو روم الترحيب.', ephemeral: true });
+        return true;
+      }
+      await channel.send({
+        content: `<@${member.id}>`,
+        allowedMentions: { users: [member.id] },
+        embeds: [
+          new EmbedBuilder()
+            .setColor(BLUE)
+            .setTitle(`🎉 حيّاك الله ${member.displayName || member.user.username}`)
+            .setDescription(
+              [
+                'نوّرت السيرفر!',
+                '',
+                `اقرأ القوانين ووافق عليها من <#${RULES_CHANNEL_ID}>،`,
+                'وأول ما تضغط «أوافق» بتنفتح لك كل الأقسام.',
+              ].join('\n'),
+            )
+            .setThumbnail(member.user.displayAvatarURL({ size: 256 }))
+            .setFooter({ text: 'u7 — الترحيب' }),
+        ],
+      });
+      await interaction.reply({ content: '✅ أرسلت الترحيب.', ephemeral: true });
+    } catch (err) {
+      console.error('[rules] welcome failed:', err.message);
+      await interaction.reply({ content: 'ما قدرت أرسل الترحيب.', ephemeral: true }).catch(() => {});
+    }
+    return true;
+  }
+
+  if (interaction.commandName !== 'rules') return false;
 
   try {
     await interaction.channel.send(panelView());
